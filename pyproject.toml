@@ -5,16 +5,16 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "vagdiag"
 version = "1.0.0"
-description = "Öppen VCDS-liknande diagnosmjukvara för äldre VAG-bilar (KWP1281 över K-line)"
+description = "Open, VCDS-like diagnostic software for older VAG cars (KWP1281 over K-line)"
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
-keywords = ["vag", "vw", "audi", "kwp1281", "kkl", "obd", "tdi", "diagnostik"]
+keywords = ["vag", "vw", "audi", "kwp1281", "kkl", "obd", "tdi", "diagnostics"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Environment :: Console",
     "Intended Audience :: End Users/Desktop",
-    "Natural Language :: Swedish",
+    "Natural Language :: English",
     "Operating System :: Microsoft :: Windows",
     "Operating System :: POSIX :: Linux",
     "Programming Language :: Python :: 3.10",

@@ -1,17 +1,19 @@
-"""Transportlager – abstraktion över K-line.
+"""Transport layer - an abstraction over the K-line.
 
-Protokollkoden i :mod:`vagdiag.kwp1281` pratar bara mot :class:`Transport`.
-Det gör att exakt samma protokollstack kan köras mot
+The protocol code in :mod:`vagdiag.kwp1281` only ever talks to
+:class:`Transport`. That lets the exact same protocol stack run against
 
-* en riktig KKL-kabel (:class:`Serietransport`), och
-* en virtuell ECU i samma process (:class:`Minnestransport`),
+* a real KKL cable (:class:`SerialTransport`), and
+* a virtual ECU inside the same process (:class:`MemoryTransport`),
 
-utan com0com, pty:er eller andra OS-beroenden. Testerna använder den senare.
+with no com0com, no pseudo terminals and no other OS dependencies. The test
+suite uses the latter.
 
-K-line är en halvduplex enledarbuss: **allt man skickar ekas tillbaka på den
-egna mottagaren**. Minnestransporten emulerar detta exakt (varje skriven byte
-hamnar både i den egna och i motpartens mottagningskö), så att echo-hanteringen
-i protokollagret testas på riktigt i stället för att specialfallas bort.
+The K-line is a half-duplex single-wire bus: **everything you send is echoed
+back on your own receiver**. The memory transport emulates that exactly (each
+written byte lands in both the local and the peer receive queue), so the echo
+handling in the protocol layer is genuinely exercised rather than special-cased
+away.
 """
 
 from __future__ import annotations
@@ -23,95 +25,95 @@ import time
 from abc import ABC, abstractmethod
 from typing import Iterator
 
-from .undantag import KWPTimeout, TransportFel
+from .exceptions import KWPTimeout, TransportError
 
 __all__ = [
     "Transport",
-    "Serietransport",
-    "Minnestransport",
-    "skapa_lankat_par",
-    "lista_portar",
-    "pyserial_finns",
-    "las_ftdi_latens",
-    "satt_ftdi_latens",
+    "SerialTransport",
+    "MemoryTransport",
+    "create_linked_pair",
+    "list_ports",
+    "pyserial_available",
+    "read_ftdi_latency",
+    "set_ftdi_latency",
 ]
 
-#: Standardbaudrate för KWP1281 över K-line.
+#: Standard baud rate for KWP1281 over the K-line.
 BAUD = 10400
 
-#: Bittid för 5-baud-initiering (1/5 sekund per bit).
-BIT_TID = 0.2
+#: Bit time for the 5-baud init (one fifth of a second per bit).
+BIT_TIME = 0.2
 
 
 class Transport(ABC):
-    """Gemensamt gränssnitt för allt som kan bära KWP1281-bytes."""
+    """Common interface for anything that can carry KWP1281 bytes."""
 
-    #: Sant om transporten ekar tillbaka det man skriver (äkta K-line gör det).
-    ekar: bool = True
+    #: True when the transport echoes what you write (a real K-line does).
+    echoes: bool = True
 
-    #: Beskrivande namn, används i loggar och felmeddelanden.
-    namn: str = "okänd"
-
-    @abstractmethod
-    def skriv_byte(self, b: int) -> None:
-        """Skriv en byte på bussen."""
+    #: Descriptive name, used in logs and error messages.
+    name: str = "unknown"
 
     @abstractmethod
-    def las_byte(self, timeout: float) -> int:
-        """Läs en byte. Kastar :class:`KWPTimeout` om inget kommer i tid."""
+    def write_byte(self, b: int) -> None:
+        """Write one byte onto the bus."""
 
     @abstractmethod
-    def rensa_in(self) -> None:
-        """Kasta allt som ligger och skräpar i mottagningsbufferten."""
+    def read_byte(self, timeout: float) -> int:
+        """Read one byte. Raises :class:`KWPTimeout` if nothing arrives in time."""
 
     @abstractmethod
-    def skicka_5baud_adress(self, adress: int) -> None:
-        """Väck styrdonet med dess adress skickad i 5 baud."""
+    def flush_input(self) -> None:
+        """Discard whatever is sitting in the receive buffer."""
 
     @abstractmethod
-    def stang(self) -> None:
-        """Stäng transporten."""
+    def send_5baud_address(self, address: int) -> None:
+        """Wake the control module with its address sent at 5 baud."""
+
+    @abstractmethod
+    def close(self) -> None:
+        """Close the transport."""
 
     def __enter__(self) -> Transport:
         return self
 
     def __exit__(self, *_exc: object) -> None:
-        self.stang()
+        self.close()
 
 
 # ---------------------------------------------------------------------------
-# Riktig serieport (FTDI FT232RL / KKL VAG 409.1)
+# Real serial port (FTDI FT232RL / KKL VAG 409.1)
 # ---------------------------------------------------------------------------
 
 
-class Serietransport(Transport):
-    """K-line över en virtuell COM-port (KKL-kabel med FT232RL).
+class SerialTransport(Transport):
+    """K-line over a virtual COM port (KKL cable with an FT232RL).
 
-    ``pyserial`` importeras lazy så att resten av paketet – och hela
-    testsviten – fungerar utan att pyserial är installerat.
+    ``pyserial`` is imported lazily so that the rest of the package - and the
+    whole test suite - works without pyserial installed.
     """
 
-    ekar = True
+    echoes = True
 
     def __init__(
         self,
         port: str,
         baud: int = BAUD,
         timeout: float = 1.0,
-        bit_tid: float = BIT_TID,
+        bit_time: float = BIT_TIME,
     ) -> None:
         try:
             import serial
-        except ImportError as fel:  # pragma: no cover - beroendekontroll
-            raise TransportFel(
-                "pyserial är inte installerat. Kör: pip install pyserial",
-                tips="pip install pyserial   (eller: pip install -e .)",
-            ) from fel
+        except ImportError as exc:  # pragma: no cover - dependency check
+            raise TransportError(
+                "pyserial is not installed. Run: pip install pyserial",
+                hint="pip install pyserial   (or: pip install -e .)",
+            ) from exc
 
-        self.namn = port
-        self.bit_tid = bit_tid
+        self.name = port
+        self.bit_time = bit_time
         try:
-            self._ser = serial.Serial(
+            self._serial = serial.Serial(
                 port=port,
                 baudrate=baud,
                 bytesize=serial.EIGHTBITS,
@@ -120,175 +122,177 @@ class Serietransport(Transport):
                 timeout=timeout,
                 write_timeout=2.0,
             )
-        except Exception as fel:  # pragma: no cover - kräver hårdvara
-            raise TransportFel(f"Kunde inte öppna {port}: {fel}") from fel
+        except Exception as exc:  # pragma: no cover - needs hardware
+            raise TransportError(f"Could not open {port}: {exc}") from exc
 
         self._timeout = timeout
-        #: FTDI Latency Timer i ms (None om okänt) – rådgivande, vi vägrar inte köra.
-        self.latens_ms = las_ftdi_latens(port)
+        #: FTDI latency timer in ms (None when unknown). Advisory only.
+        self.latency_ms = read_ftdi_latency(port)
 
-    # -- byteström ---------------------------------------------------------
+    # -- byte stream -------------------------------------------------------
 
-    def skriv_byte(self, b: int) -> None:
+    def write_byte(self, b: int) -> None:
         try:
-            self._ser.write(bytes([b & 0xFF]))
-            self._ser.flush()
-        except Exception as fel:  # pragma: no cover - kräver hårdvara
-            raise TransportFel(f"Skrivfel på {self.namn}: {fel}") from fel
+            self._serial.write(bytes([b & 0xFF]))
+            self._serial.flush()
+        except Exception as exc:  # pragma: no cover - needs hardware
+            raise TransportError(f"Write error on {self.name}: {exc}") from exc
 
-    def las_byte(self, timeout: float) -> int:
+    def read_byte(self, timeout: float) -> int:
         if timeout != self._timeout:
-            self._ser.timeout = timeout
+            self._serial.timeout = timeout
             self._timeout = timeout
         try:
-            data = self._ser.read(1)
-        except Exception as fel:  # pragma: no cover - kräver hårdvara
-            raise TransportFel(f"Läsfel på {self.namn}: {fel}") from fel
+            data = self._serial.read(1)
+        except Exception as exc:  # pragma: no cover - needs hardware
+            raise TransportError(f"Read error on {self.name}: {exc}") from exc
         if not data:
-            raise KWPTimeout(f"Inget svar från styrdonet inom {timeout:.2f} s.")
+            raise KWPTimeout(
+                f"No answer from the control module within {timeout:.2f} s."
+            )
         return data[0]
 
-    def rensa_in(self) -> None:
+    def flush_input(self) -> None:
         try:
-            self._ser.reset_input_buffer()
-        except Exception:  # pragma: no cover - kräver hårdvara
+            self._serial.reset_input_buffer()
+        except Exception:  # pragma: no cover - needs hardware
             pass
 
-    # -- 5-baud-väckning ---------------------------------------------------
+    # -- 5-baud wake-up ----------------------------------------------------
 
-    def skicka_5baud_adress(self, adress: int) -> None:
-        """Bit-banga styrdonsadressen med break-condition, 200 ms per bit.
+    def send_5baud_address(self, address: int) -> None:
+        """Bit-bang the module address using the break condition, 200 ms per bit.
 
-        Ordning: startbit (break PÅ), 8 databitar LSB först (0 = break PÅ,
-        1 = break AV), stoppbit (break AV).
+        Order: start bit (break ON), eight data bits LSB first (0 = break ON,
+        1 = break OFF), stop bit (break OFF).
         """
-        self.rensa_in()
-        ser = self._ser
+        self.flush_input()
+        ser = self._serial
         try:
-            ser.break_condition = True          # startbit
-            time.sleep(self.bit_tid)
+            ser.break_condition = True          # start bit
+            time.sleep(self.bit_time)
             for i in range(8):
-                bit = (adress >> i) & 1
+                bit = (address >> i) & 1
                 ser.break_condition = bit == 0
-                time.sleep(self.bit_tid)
-            ser.break_condition = False         # stoppbit
-            time.sleep(self.bit_tid)
-        except Exception as fel:  # pragma: no cover - kräver hårdvara
-            raise TransportFel(
-                f"Kunde inte skicka 5-baud-adress på {self.namn}: {fel}"
-            ) from fel
+                time.sleep(self.bit_time)
+            ser.break_condition = False         # stop bit
+            time.sleep(self.bit_time)
+        except Exception as exc:  # pragma: no cover - needs hardware
+            raise TransportError(
+                f"Could not send the 5-baud address on {self.name}: {exc}"
+            ) from exc
         finally:
             try:
                 ser.break_condition = False
             except Exception:  # pragma: no cover
                 pass
-        self.rensa_in()
+        self.flush_input()
 
-    def stang(self) -> None:
+    def close(self) -> None:
         try:
-            self._ser.close()
+            self._serial.close()
         except Exception:  # pragma: no cover
             pass
 
 
 # ---------------------------------------------------------------------------
-# Virtuell buss i minnet (för simulatorn och testerna)
+# Virtual in-memory bus (for the simulator and the tests)
 # ---------------------------------------------------------------------------
 
 
-class Minnestransport(Transport):
-    """En ände av en virtuell K-line-buss.
+class MemoryTransport(Transport):
+    """One end of a virtual K-line bus.
 
-    Skrivna bytes hamnar i *både* den egna kön (ekot) och motpartens kö,
-    precis som på en riktig enledarbuss.
+    Written bytes land in *both* the local queue (the echo) and the peer's
+    queue, exactly as on a real single-wire bus.
     """
 
-    ekar = True
+    echoes = True
 
     def __init__(
         self,
-        egen: queue.Queue[int],
-        motpart: queue.Queue[int],
-        fem_baud: queue.Queue[int],
-        ar_klient: bool,
-        namn: str = "minne",
+        own: queue.Queue[int],
+        peer: queue.Queue[int],
+        five_baud: queue.Queue[int],
+        is_client: bool,
+        name: str = "memory",
     ) -> None:
-        self._egen = egen
-        self._motpart = motpart
-        self._fem_baud = fem_baud
-        self._ar_klient = ar_klient
-        self.namn = namn
-        self.stangd = False
+        self._own = own
+        self._peer = peer
+        self._five_baud = five_baud
+        self._is_client = is_client
+        self.name = name
+        self.closed = False
 
-    def skriv_byte(self, b: int) -> None:
-        if self.stangd:
-            raise TransportFel("Transporten är stängd.")
+    def write_byte(self, b: int) -> None:
+        if self.closed:
+            raise TransportError("The transport is closed.")
         b &= 0xFF
-        self._egen.put(b)      # eko på egen mottagare
-        self._motpart.put(b)   # motparten hör samma byte
+        self._own.put(b)   # echo on our own receiver
+        self._peer.put(b)  # the peer hears the same byte
 
-    def las_byte(self, timeout: float) -> int:
+    def read_byte(self, timeout: float) -> int:
         try:
-            return self._egen.get(timeout=max(timeout, 0.0))
+            return self._own.get(timeout=max(timeout, 0.0))
         except queue.Empty:
             raise KWPTimeout(
-                f"Inget svar på den virtuella bussen inom {timeout:.2f} s."
+                f"Nothing on the virtual bus within {timeout:.2f} s."
             ) from None
 
-    def rensa_in(self) -> None:
-        _tom(self._egen)
+    def flush_input(self) -> None:
+        _drain(self._own)
 
-    def skicka_5baud_adress(self, adress: int) -> None:
-        """Logisk motsvarighet till 5-baud-väckningen.
+    def send_5baud_address(self, address: int) -> None:
+        """Logical equivalent of the 5-baud wake-up.
 
-        Bussen är tyst medan väckningen pågår, så båda köerna töms först.
+        The bus is silent while the wake-up runs, so both queues are drained.
         """
-        if not self._ar_klient:
-            raise TransportFel("Endast klientsidan kan skicka 5-baud-adress.")
-        _tom(self._egen)
-        _tom(self._motpart)
-        _tom(self._fem_baud)
-        self._fem_baud.put(adress & 0xFF)
+        if not self._is_client:
+            raise TransportError("Only the client side can send a 5-baud address.")
+        _drain(self._own)
+        _drain(self._peer)
+        _drain(self._five_baud)
+        self._five_baud.put(address & 0xFF)
 
-    def las_5baud_adress(self, timeout: float) -> int:
-        """ECU-sidan: vänta på en 5-baud-väckning. Kastar KWPTimeout."""
-        if self._ar_klient:
-            raise TransportFel("Endast ECU-sidan kan läsa 5-baud-adress.")
+    def read_5baud_address(self, timeout: float) -> int:
+        """ECU side: wait for a 5-baud wake-up. Raises KWPTimeout."""
+        if self._is_client:
+            raise TransportError("Only the ECU side can read a 5-baud address.")
         try:
-            return self._fem_baud.get(timeout=max(timeout, 0.0))
+            return self._five_baud.get(timeout=max(timeout, 0.0))
         except queue.Empty:
-            raise KWPTimeout("Ingen 5-baud-väckning mottagen.") from None
+            raise KWPTimeout("No 5-baud wake-up received.") from None
 
-    def stang(self) -> None:
-        self.stangd = True
+    def close(self) -> None:
+        self.closed = True
 
 
-def _tom(k: queue.Queue[int]) -> None:
-    """Töm en kö utan att blockera."""
+def _drain(q: queue.Queue[int]) -> None:
+    """Empty a queue without blocking."""
     while True:
         try:
-            k.get_nowait()
+            q.get_nowait()
         except queue.Empty:
             return
 
 
-def skapa_lankat_par() -> tuple[Minnestransport, Minnestransport]:
-    """Skapa (klienttransport, ecutransport) kopplade till samma virtuella buss."""
-    ko_klient: queue.Queue[int] = queue.Queue()
-    ko_ecu: queue.Queue[int] = queue.Queue()
-    ko_5baud: queue.Queue[int] = queue.Queue()
-    klient = Minnestransport(ko_klient, ko_ecu, ko_5baud, True, "minne:klient")
-    ecu = Minnestransport(ko_ecu, ko_klient, ko_5baud, False, "minne:ecu")
-    return klient, ecu
+def create_linked_pair() -> tuple[MemoryTransport, MemoryTransport]:
+    """Create (client transport, ECU transport) sharing one virtual bus."""
+    client_queue: queue.Queue[int] = queue.Queue()
+    ecu_queue: queue.Queue[int] = queue.Queue()
+    wake_queue: queue.Queue[int] = queue.Queue()
+    client = MemoryTransport(client_queue, ecu_queue, wake_queue, True, "memory:client")
+    ecu = MemoryTransport(ecu_queue, client_queue, wake_queue, False, "memory:ecu")
+    return client, ecu
 
 
 # ---------------------------------------------------------------------------
-# Hjälpfunktioner för portar och FTDI-latens
+# Port and FTDI latency helpers
 # ---------------------------------------------------------------------------
 
 
-def pyserial_finns() -> bool:
-    """True om pyserial går att importera."""
+def pyserial_available() -> bool:
+    """True when pyserial can be imported."""
     try:
         import serial  # noqa: F401
     except ImportError:
@@ -296,101 +300,99 @@ def pyserial_finns() -> bool:
     return True
 
 
-def lista_portar() -> list[tuple[str, str]]:
-    """Returnera [(port, beskrivning), ...]. Tom lista om pyserial saknas."""
+def list_ports() -> list[tuple[str, str]]:
+    """Return [(port, description), ...]. Empty when pyserial is missing."""
     try:
-        from serial.tools import list_ports
+        from serial.tools import list_ports as _list_ports
     except ImportError:
         return []
-    return [(p.device, p.description or "") for p in list_ports.comports()]
+    return [(p.device, p.description or "") for p in _list_ports.comports()]
 
 
-def _ftdi_nycklar() -> Iterator[tuple[str, object]]:
-    """Iterera över (portnamn, öppen registernyckel) för FTDI-enheter (Windows).
+def _ftdi_keys() -> Iterator[tuple[str, object]]:
+    """Yield (port name, open registry key) for FTDI devices on Windows.
 
-    Anroparen ansvarar för att stänga varje utlämnad nyckel.
+    The caller is responsible for closing each yielded key.
     """
-    if os.name != "nt":  # pragma: no cover - endast Windows
+    if os.name != "nt":  # pragma: no cover - Windows only
         return
     import winreg
 
-    bas = r"SYSTEM\CurrentControlSet\Enum\FTDIBUS"
+    base = r"SYSTEM\CurrentControlSet\Enum\FTDIBUS"
     try:
-        rot = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, bas)
+        root = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, base)
     except OSError:
         return
-    with rot:
+    with root:
         i = 0
         while True:
             try:
-                enhet = winreg.EnumKey(rot, i)
+                device = winreg.EnumKey(root, i)
             except OSError:
                 return
             i += 1
-            sokvag = f"{bas}\\{enhet}\\0000\\Device Parameters"
-            nyckel = None
-            for atkomst in (winreg.KEY_READ | winreg.KEY_SET_VALUE, winreg.KEY_READ):
+            path = f"{base}\\{device}\\0000\\Device Parameters"
+            key = None
+            for access in (winreg.KEY_READ | winreg.KEY_SET_VALUE, winreg.KEY_READ):
                 try:
-                    nyckel = winreg.OpenKey(
-                        winreg.HKEY_LOCAL_MACHINE, sokvag, 0, atkomst
-                    )
+                    key = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, path, 0, access)
                     break
                 except OSError:
                     continue
-            if nyckel is None:
+            if key is None:
                 continue
             try:
-                port = str(winreg.QueryValueEx(nyckel, "PortName")[0])
+                port = str(winreg.QueryValueEx(key, "PortName")[0])
             except OSError:
-                nyckel.Close()
+                key.Close()
                 continue
-            yield port, nyckel
+            yield port, key
 
 
-def las_ftdi_latens(port: str) -> int | None:
-    """Läs FTDI Latency Timer (ms) för given COM-port. None om okänt."""
-    if os.name != "nt":  # pragma: no cover - endast Windows
+def read_ftdi_latency(port: str) -> int | None:
+    """Read the FTDI latency timer (ms) for a COM port. None when unknown."""
+    if os.name != "nt":  # pragma: no cover - Windows only
         return None
     import winreg
 
-    for portnamn, nyckel in _ftdi_nycklar():
+    for port_name, key in _ftdi_keys():
         try:
-            if portnamn.upper() != port.upper():
+            if port_name.upper() != port.upper():
                 continue
             try:
-                return int(winreg.QueryValueEx(nyckel, "LatencyTimer")[0])
+                return int(winreg.QueryValueEx(key, "LatencyTimer")[0])
             except OSError:
                 return None
         finally:
-            nyckel.Close()  # type: ignore[attr-defined]
+            key.Close()  # type: ignore[attr-defined]
     return None
 
 
-def satt_ftdi_latens(port: str, ms: int = 1) -> bool:
-    """Försök sätta FTDI Latency Timer till ``ms``.
+def set_ftdi_latency(port: str, ms: int = 1) -> bool:
+    """Try to set the FTDI latency timer to ``ms``.
 
-    Kräver administratörsrättigheter, och enheten måste kopplas ur/i (eller
-    datorn startas om) innan det slår igenom. Returnerar True vid lyckad
-    skrivning. Se README för den manuella vägen via Enhetshanteraren.
+    Requires administrator rights, and the device must be unplugged and
+    replugged (or the machine rebooted) before it takes effect. Returns True on
+    a successful write. See the README for the manual route via Device Manager.
     """
-    if os.name != "nt":  # pragma: no cover - endast Windows
+    if os.name != "nt":  # pragma: no cover - Windows only
         return False
     import winreg
 
-    for portnamn, nyckel in _ftdi_nycklar():
+    for port_name, key in _ftdi_keys():
         try:
-            if portnamn.upper() != port.upper():
+            if port_name.upper() != port.upper():
                 continue
             try:
-                winreg.SetValueEx(nyckel, "LatencyTimer", 0, winreg.REG_DWORD, ms)
+                winreg.SetValueEx(key, "LatencyTimer", 0, winreg.REG_DWORD, ms)
                 return True
             except OSError:
                 return False
         finally:
-            nyckel.Close()  # type: ignore[attr-defined]
+            key.Close()  # type: ignore[attr-defined]
     return False
 
 
-def ar_windows() -> bool:
-    """True om vi kör på Windows (används för OS-specifika tips)."""
+def is_windows() -> bool:
+    """True when running on Windows (used for OS-specific hints)."""
     return sys.platform.startswith("win")

@@ -1,19 +1,21 @@
-"""Virtuell KWP1281-ECU för utveckling och test utan bil.
+"""Virtual KWP1281 ECU for development and testing without a car.
 
-Simulatorn kopplas in via :func:`vagdiag.transport.skapa_lankat_par`, alltså
-direkt i minnet utan com0com, pty:er eller riktiga serieportar. Den kör exakt
-samma block- och kvittenslogik som klienten (:class:`vagdiag.kwp1281.KWPKanal`),
-så hela protokollstacken testas på riktigt.
+The simulator is wired in through :func:`vagdiag.transport.create_linked_pair`,
+i.e. directly in memory - no com0com, no pseudo terminals, no real serial port.
+It runs exactly the same block and acknowledgement logic as the client
+(:class:`vagdiag.kwp1281.KWPChannel`), so the whole protocol stack is genuinely
+exercised.
 
-Simulatorn föreställer ett motorstyrdon till en 1.9 TDI med VP37 och serverar
+The simulator pretends to be the engine module of a 1.9 TDI with a VP37 pump
+and serves
 
-* identifikationsblock ``1Z9906019 TDI SIMULATOR``,
-* mätvärdesblock 1–13 med värden som varierar realistiskt över tid,
-* felkoderna 17965 (sporadisk) och 00560,
-* en ställdonssekvens och några anpassningskanaler.
+* identification blocks ``1Z9906019 TDI SIMULATOR``,
+* measuring blocks 1-13 with values that vary realistically over time,
+* fault codes 17965 (intermittent) and 00560,
+* an actuator sequence and a handful of adaptation channels.
 
-Dessutom kan fel injiceras (tappad kvittens, tystnad, korrupt block) för att
-verifiera att klienten hanterar trasiga sessioner snyggt.
+Faults can also be injected (dropped acknowledgement, silence, corrupt block)
+to verify that the client handles broken sessions gracefully.
 """
 
 from __future__ import annotations
@@ -24,452 +26,460 @@ import time
 from dataclasses import dataclass
 from typing import Callable
 
-from . import formler
-from .kwp1281 import ETX, Block, Blocktitel, KWPKanal
-from .transport import Minnestransport, skapa_lankat_par
-from .undantag import KWPTimeout, VagdiagFel
+from . import formulas
+from .exceptions import KWPTimeout, VagdiagError
+from .kwp1281 import ETX, Block, BlockTitle, KWPChannel
+from .transport import MemoryTransport, create_linked_pair
 
 __all__ = [
-    "Felinjektion",
-    "SimuleradECU",
-    "starta_simulator",
-    "SIM_FELKODER",
-    "SIM_STALLDON",
+    "FaultInjection",
+    "SimulatedECU",
+    "start_simulator",
+    "SimulatorLink",
+    "SIM_FAULTS",
+    "SIM_ACTUATORS",
+    "SIM_LOGIN",
 ]
 
-#: Nyckelbytes som simulatorn skickar efter 5-baud-väckningen.
-KEYBYTE_1 = 0x01
-KEYBYTE_2 = 0x8A
+#: Key bytes the simulator sends after the 5-baud wake-up.
+KEY_BYTE_1 = 0x01
+KEY_BYTE_2 = 0x8A
 
-#: Felkoder i det simulerade minnet: (kod, status).
-SIM_FELKODER: list[tuple[int, int]] = [
-    (17965, 0xAA),  # laddtrycksreglering positiv avvikelse, sporadisk
-    (560, 0x2A),    # EGR reglergräns, statisk
+#: Fault codes in the simulated memory: (code, status).
+SIM_FAULTS: list[tuple[int, int]] = [
+    (17965, 0xAA),  # charge pressure positive deviation, intermittent
+    (560, 0x2A),    # EGR control limit, static
 ]
 
-#: Ställdonssekvens som simulatorn stegar igenom.
-SIM_STALLDON: list[int] = [0x0102, 0x0103, 0x0101, 0x010C]
+#: Actuator sequence the simulator steps through.
+SIM_ACTUATORS: list[int] = [0x0102, 0x0103, 0x0101, 0x010C]
 
-#: Startvärden för anpassningskanaler.
-SIM_ANPASSNING: dict[int, int] = {0: 0, 1: 32768, 2: 100, 3: 15000, 4: 1}
+#: Initial values for the adaptation channels.
+SIM_ADAPTATION: dict[int, int] = {0: 0, 1: 32768, 2: 100, 3: 15000, 4: 1}
 
-#: Login-kod som simulatorn accepterar.
+#: Login code the simulator accepts.
 SIM_LOGIN = 11463
 
 
 @dataclass
-class Felinjektion:
-    """Engångsflaggor för att provocera fram fel hos klienten.
+class FaultInjection:
+    """One-shot flags used to provoke failures in the client.
 
-    Alla ``*_nasta_*``-flaggor nollställs automatiskt när de har använts.
+    Every ``*_next_*`` flag clears itself once it has been used.
     """
 
-    svara_inte_pa_init: bool = False
-    fel_synkbyte: bool = False
-    tappa_nasta_kvittens: bool = False
-    korrupt_nasta_kvittens: bool = False
-    tyst_pa_nasta_kommando: bool = False
-    korrupt_etx_i_nasta_svar: bool = False
-    fel_raknare_i_nasta_svar: bool = False
+    no_init_response: bool = False
+    bad_sync_byte: bool = False
+    drop_next_ack: bool = False
+    corrupt_next_ack: bool = False
+    silent_on_next_command: bool = False
+    corrupt_etx_in_next_response: bool = False
+    bad_counter_in_next_response: bool = False
 
 
-class _ECUKanal(KWPKanal):
-    """Blockkanal med möjlighet att injicera protokollfel."""
+class _ECUChannel(KWPChannel):
+    """Block channel that can inject protocol faults."""
 
-    def __init__(self, transport: Minnestransport, fel: Felinjektion, **kw: object) -> None:
+    def __init__(
+        self, transport: MemoryTransport, faults: FaultInjection, **kw: object
+    ) -> None:
         super().__init__(transport, **kw)  # type: ignore[arg-type]
-        self.fel = fel
+        self.faults = faults
 
-    def _kvittera(self, b: int) -> None:
-        if self.fel.tappa_nasta_kvittens:
-            self.fel.tappa_nasta_kvittens = False
-            return  # tyst – klienten ska få timeout
-        if self.fel.korrupt_nasta_kvittens:
-            self.fel.korrupt_nasta_kvittens = False
-            if self.ack_fordrojning:
-                time.sleep(self.ack_fordrojning)
-            self.skriv_ra(b)  # fel komplement
+    def _acknowledge(self, b: int) -> None:
+        if self.faults.drop_next_ack:
+            self.faults.drop_next_ack = False
+            return  # silence - the client should time out
+        if self.faults.corrupt_next_ack:
+            self.faults.corrupt_next_ack = False
+            if self.ack_delay:
+                time.sleep(self.ack_delay)
+            self.write_raw(b)  # wrong complement
             return
-        super()._kvittera(b)
+        super()._acknowledge(b)
 
-    def skicka_block(self, titel: int, data: bytes | list[int] = b"") -> Block:
-        if self.fel.korrupt_etx_i_nasta_svar:
-            self.fel.korrupt_etx_i_nasta_svar = False
-            return self._skicka_block_ra(titel, bytes(data), etx=0x00)
-        if self.fel.fel_raknare_i_nasta_svar:
-            self.fel.fel_raknare_i_nasta_svar = False
-            return self._skicka_block_ra(titel, bytes(data), raknaroffset=7)
-        return super().skicka_block(titel, data)
+    def send_block(self, title: int, data: bytes | list[int] = b"") -> Block:
+        if self.faults.corrupt_etx_in_next_response:
+            self.faults.corrupt_etx_in_next_response = False
+            return self._send_block_raw(title, bytes(data), etx=0x00)
+        if self.faults.bad_counter_in_next_response:
+            self.faults.bad_counter_in_next_response = False
+            return self._send_block_raw(title, bytes(data), counter_offset=7)
+        return super().send_block(title, data)
 
-    def _skicka_block_ra(
-        self, titel: int, data: bytes, etx: int = ETX, raknaroffset: int = 0
+    def _send_block_raw(
+        self, title: int, data: bytes, etx: int = ETX, counter_offset: int = 0
     ) -> Block:
-        """Skicka ett block med avsiktligt fel i räknare eller avslutningsbyte."""
-        langd = 3 + len(data)
-        raknare = (self.nasta_raknare() + raknaroffset) & 0xFF
-        ram = bytes([langd, raknare, titel & 0xFF]) + data
-        for b in ram:
-            self.skriv_ra(b)
-            self.las_ra()  # klientens kvittens, ignoreras medvetet
-        self.skriv_ra(etx)
-        return Block(titel & 0xFF, data, raknare)
+        """Send a block with a deliberate fault in the counter or the ETX byte."""
+        length = 3 + len(data)
+        counter = (self.next_counter() + counter_offset) & 0xFF
+        frame = bytes([length, counter, title & 0xFF]) + data
+        for b in frame:
+            self.write_raw(b)
+            self.read_raw()  # the client's acknowledgement, deliberately ignored
+        self.write_raw(etx)
+        return Block(title & 0xFF, data, counter)
 
 
-class SimuleradECU(threading.Thread):
-    """En virtuell ECU som svarar på KWP1281 över en :class:`Minnestransport`."""
+class SimulatedECU(threading.Thread):
+    """A virtual ECU answering KWP1281 over a :class:`MemoryTransport`."""
 
     def __init__(
         self,
-        transport: Minnestransport,
-        adress: int = 0x01,
-        fel: Felinjektion | None = None,
-        delnummer: str = "1Z9906019 ",
-        komponent: str = "TDI SIMULATOR   ",
-        kodning: int = 1,
+        transport: MemoryTransport,
+        address: int = 0x01,
+        faults: FaultInjection | None = None,
+        part_number: str = "1Z9906019 ",
+        component: str = "TDI SIMULATOR   ",
+        coding: int = 1,
         wsc: int = 12345,
-        sessionstimeout: float = 5.0,
-        bytetimeout: float = 1.0,
-        ack_fordrojning: float = 0.0,
-        klocka: Callable[[], float] | None = None,
+        session_timeout: float = 5.0,
+        byte_timeout: float = 1.0,
+        ack_delay: float = 0.0,
+        clock: Callable[[], float] | None = None,
     ) -> None:
-        super().__init__(name="simulerad-ecu", daemon=True)
+        super().__init__(name="simulated-ecu", daemon=True)
         self.transport = transport
-        self.adress = adress
-        self.fel = fel or Felinjektion()
-        self.delnummer = delnummer
-        self.komponent = komponent
-        self.kodning = kodning
+        self.address = address
+        self.faults = faults or FaultInjection()
+        self.part_number = part_number
+        self.component = component
+        self.coding = coding
         self.wsc = wsc
-        self.sessionstimeout = sessionstimeout
-        self.bytetimeout = bytetimeout
-        self.ack_fordrojning = ack_fordrojning
-        self.klocka = klocka or time.monotonic
-        self._t0 = self.klocka()
+        self.session_timeout = session_timeout
+        self.byte_timeout = byte_timeout
+        self.ack_delay = ack_delay
+        self.clock = clock or time.monotonic
+        self._t0 = self.clock()
 
-        self._stopp = threading.Event()
-        self.felkoder: list[tuple[int, int]] = list(SIM_FELKODER)
-        self.anpassning: dict[int, int] = dict(SIM_ANPASSNING)
-        self.inloggad = False
-        self.sessioner = 0
-        self.raderingar = 0
-        self._stalldonsindex = 0
-        self.senaste_fel: str = ""
+        self._stop_event = threading.Event()
+        self.fault_memory: list[tuple[int, int]] = list(SIM_FAULTS)
+        self.adaptation: dict[int, int] = dict(SIM_ADAPTATION)
+        self.logged_in = False
+        self.sessions = 0
+        self.clears = 0
+        self._actuator_index = 0
+        self.last_error: str = ""
 
-    # -- livscykel ---------------------------------------------------------
+    # -- lifecycle ---------------------------------------------------------
 
-    def stoppa(self) -> None:
-        """Be simulatortråden avsluta och vänta in den."""
-        self._stopp.set()
+    def stop(self) -> None:
+        """Ask the simulator thread to finish and join it."""
+        self._stop_event.set()
         if self.is_alive() and threading.current_thread() is not self:
             self.join(timeout=3.0)
 
-    def run(self) -> None:  # pragma: no cover - trådstart täcks indirekt
-        while not self._stopp.is_set():
+    def run(self) -> None:  # pragma: no cover - thread start covered indirectly
+        while not self._stop_event.is_set():
             try:
-                adress = self.transport.las_5baud_adress(0.1)
+                address = self.transport.read_5baud_address(0.1)
             except KWPTimeout:
                 continue
-            except VagdiagFel:
+            except VagdiagError:
                 return
-            if adress != self.adress:
-                continue  # tyst styrdon på den adressen
+            if address != self.address:
+                continue  # no module at that address
             try:
                 self._session()
-            except VagdiagFel as f:
-                self.senaste_fel = str(f)
-            except Exception as f:  # skyddar tråden mot oväntade fel
-                self.senaste_fel = f"internt simulatorfel: {f!r}"
+            except VagdiagError as exc:
+                self.last_error = str(exc)
+            except Exception as exc:  # protect the thread from surprises
+                self.last_error = f"internal simulator fault: {exc!r}"
 
     # -- session -----------------------------------------------------------
 
     def _session(self) -> None:
-        """Kör en komplett diagnossession från väckning till avslut."""
-        if self.fel.svara_inte_pa_init:
-            self.fel.svara_inte_pa_init = False
+        """Run a complete diagnostic session from wake-up to shutdown."""
+        if self.faults.no_init_response:
+            self.faults.no_init_response = False
             return
 
-        kanal = _ECUKanal(
+        channel = _ECUChannel(
             self.transport,
-            self.fel,
-            timeout=self.bytetimeout,
-            ack_fordrojning=self.ack_fordrojning,
+            self.faults,
+            timeout=self.byte_timeout,
+            ack_delay=self.ack_delay,
         )
-        self.sessioner += 1
-        self._stalldonsindex = 0
-        self.inloggad = False
+        self.sessions += 1
+        self._actuator_index = 0
+        self.logged_in = False
 
         time.sleep(0.01)
-        kanal.skriv_ra(0x00 if self.fel.fel_synkbyte else 0x55)
-        if self.fel.fel_synkbyte:
-            self.fel.fel_synkbyte = False
+        channel.write_raw(0x00 if self.faults.bad_sync_byte else 0x55)
+        if self.faults.bad_sync_byte:
+            self.faults.bad_sync_byte = False
             return
-        kanal.skriv_ra(KEYBYTE_1)
-        kanal.skriv_ra(KEYBYTE_2)
+        channel.write_raw(KEY_BYTE_1)
+        channel.write_raw(KEY_BYTE_2)
 
-        komplement = kanal.las_ra(2.0)
-        if komplement != (~KEYBYTE_2) & 0xFF:
-            return  # klienten svarade fel – avbryt tyst, precis som ett styrdon
+        complement = channel.read_raw(2.0)
+        if complement != (~KEY_BYTE_2) & 0xFF:
+            return  # wrong answer - abort silently, just like a real module
 
-        for data in self._identblock():
-            kanal.skicka_block(Blocktitel.IDENT, data)
-            kanal.las_block()  # klientens ACK
-        kanal.skicka_block(Blocktitel.ACK)
+        for data in self._ident_blocks():
+            channel.send_block(BlockTitle.IDENT, data)
+            channel.read_block()  # the client's ACK
+        channel.send_block(BlockTitle.ACK)
 
-        # Vänta på kommandon i korta pass, så att tråden både kan avslutas
-        # snabbt och tappa sessionen när bussen varit tyst för länge – precis
-        # som ett riktigt styrdon gör utan keep-alive.
-        senaste = time.monotonic()
-        while not self._stopp.is_set():
+        # Wait for commands in short slices so the thread can shut down quickly
+        # and still drop the session when the bus has been quiet for too long -
+        # exactly what a real module does without keep-alive.
+        last = time.monotonic()
+        while not self._stop_event.is_set():
             try:
-                block = kanal.las_block(0.05)
+                block = channel.read_block(0.05)
             except KWPTimeout:
-                if time.monotonic() - senaste > self.sessionstimeout:
+                if time.monotonic() - last > self.session_timeout:
                     return
                 continue
-            senaste = time.monotonic()
-            if not self._hantera(kanal, block):
+            last = time.monotonic()
+            if not self._dispatch(channel, block):
                 return
 
-    def _identblock(self) -> list[bytes]:
-        """Identifikationsblockens nyttolaster."""
-        kodningsblock = bytes(
+    def _ident_blocks(self) -> list[bytes]:
+        """Payloads of the identification blocks."""
+        coding_block = bytes(
             [
-                (self.kodning >> 14) & 0x7F,
-                (self.kodning >> 7) & 0x7F,
-                self.kodning & 0x7F,
+                (self.coding >> 14) & 0x7F,
+                (self.coding >> 7) & 0x7F,
+                self.coding & 0x7F,
                 (self.wsc >> 7) & 0x7F,
                 self.wsc & 0x7F,
             ]
         )
         return [
-            self.delnummer.encode("latin-1"),
-            self.komponent.encode("latin-1"),
-            kodningsblock,
+            self.part_number.encode("latin-1"),
+            self.component.encode("latin-1"),
+            coding_block,
         ]
 
-    # -- kommandohantering -------------------------------------------------
+    # -- command handling --------------------------------------------------
 
-    def _hantera(self, kanal: _ECUKanal, block: Block) -> bool:
-        """Besvara ett kommandoblock. Returnerar False när sessionen ska avslutas."""
-        if self.fel.tyst_pa_nasta_kommando:
-            self.fel.tyst_pa_nasta_kommando = False
-            return True  # inget svar – klienten får timeout
+    def _dispatch(self, channel: _ECUChannel, block: Block) -> bool:
+        """Answer one command block. Returns False when the session should end."""
+        if self.faults.silent_on_next_command:
+            self.faults.silent_on_next_command = False
+            return True  # no answer - the client gets a timeout
 
-        titel = block.titel
+        title = block.title
         data = block.data
 
-        if titel == Blocktitel.AVSLUTA:
+        if title == BlockTitle.END_SESSION:
             return False
 
-        if titel == Blocktitel.ACK:
-            kanal.skicka_block(Blocktitel.ACK)
+        if title == BlockTitle.ACK:
+            channel.send_block(BlockTitle.ACK)
             return True
 
-        if titel == Blocktitel.LAS_FELKODER:
-            self._skicka_felkoder(kanal)
+        if title == BlockTitle.READ_FAULTS:
+            self._send_faults(channel)
             return True
 
-        if titel == Blocktitel.RADERA_FELKODER:
-            self.felkoder.clear()
-            self.raderingar += 1
-            kanal.skicka_block(Blocktitel.ACK)
+        if title == BlockTitle.CLEAR_FAULTS:
+            self.fault_memory.clear()
+            self.clears += 1
+            channel.send_block(BlockTitle.ACK)
             return True
 
-        if titel in (Blocktitel.LAS_MATGRUPP, Blocktitel.GRUNDINSTALLNING):
-            grupp = data[0] if data else 1
-            varden = self.matgrupp(grupp)
-            if not varden:
-                kanal.skicka_block(Blocktitel.ACK)
+        if title in (BlockTitle.READ_GROUP, BlockTitle.BASIC_SETTING):
+            group = data[0] if data else 1
+            values = self.group_data(group)
+            if not values:
+                channel.send_block(BlockTitle.ACK)
             else:
-                kanal.skicka_block(Blocktitel.MATVARDEN, varden)
+                channel.send_block(BlockTitle.GROUP_READING, values)
             return True
 
-        if titel == Blocktitel.STALLDONSTEST:
-            if self._stalldonsindex < len(SIM_STALLDON):
-                kod = SIM_STALLDON[self._stalldonsindex]
-                self._stalldonsindex += 1
-                kanal.skicka_block(
-                    Blocktitel.STALLDONSSVAR, bytes([(kod >> 8) & 0xFF, kod & 0xFF])
+        if title == BlockTitle.ACTUATOR_TEST:
+            if self._actuator_index < len(SIM_ACTUATORS):
+                code = SIM_ACTUATORS[self._actuator_index]
+                self._actuator_index += 1
+                channel.send_block(
+                    BlockTitle.ACTUATOR_RESPONSE,
+                    bytes([(code >> 8) & 0xFF, code & 0xFF]),
                 )
             else:
-                kanal.skicka_block(Blocktitel.ACK)
+                channel.send_block(BlockTitle.ACK)
             return True
 
-        if titel == Blocktitel.LAS_ANPASSNING:
-            kanal_nr = data[0] if data else 0
-            self._svara_anpassning(kanal, kanal_nr, self.anpassning.get(kanal_nr, 0))
+        if title == BlockTitle.READ_ADAPTATION:
+            number = data[0] if data else 0
+            self._send_adaptation(channel, number, self.adaptation.get(number, 0))
             return True
 
-        if titel == Blocktitel.TESTA_ANPASSNING:
-            kanal_nr = data[0] if data else 0
-            varde = (data[1] << 8) | data[2] if len(data) >= 3 else 0
-            self._svara_anpassning(kanal, kanal_nr, varde)
+        if title == BlockTitle.TEST_ADAPTATION:
+            number = data[0] if data else 0
+            value = (data[1] << 8) | data[2] if len(data) >= 3 else 0
+            self._send_adaptation(channel, number, value)
             return True
 
-        if titel == Blocktitel.SPARA_ANPASSNING:
-            kanal_nr = data[0] if data else 0
-            varde = (data[1] << 8) | data[2] if len(data) >= 3 else 0
-            self.anpassning[kanal_nr] = varde
-            self._svara_anpassning(kanal, kanal_nr, varde)
+        if title == BlockTitle.SAVE_ADAPTATION:
+            number = data[0] if data else 0
+            value = (data[1] << 8) | data[2] if len(data) >= 3 else 0
+            self.adaptation[number] = value
+            self._send_adaptation(channel, number, value)
             return True
 
-        if titel == Blocktitel.LOGIN:
-            kod = (data[0] << 8) | data[1] if len(data) >= 2 else 0
-            self.inloggad = kod == SIM_LOGIN
-            kanal.skicka_block(
-                Blocktitel.ACK if self.inloggad else Blocktitel.EJ_TILLGANGLIG
+        if title == BlockTitle.LOGIN:
+            code = (data[0] << 8) | data[1] if len(data) >= 2 else 0
+            self.logged_in = code == SIM_LOGIN
+            channel.send_block(
+                BlockTitle.ACK if self.logged_in else BlockTitle.NOT_AVAILABLE
             )
             return True
 
-        # Okänt kommando – styrdonet svarar "ej tillgänglig".
-        kanal.skicka_block(Blocktitel.EJ_TILLGANGLIG)
+        # Unknown command - the module answers "not available".
+        channel.send_block(BlockTitle.NOT_AVAILABLE)
         return True
 
-    def _skicka_felkoder(self, kanal: _ECUKanal) -> None:
-        """Skicka felkodsminnet, max fyra koder per block."""
-        if not self.felkoder:
-            kanal.skicka_block(Blocktitel.FELKODER, bytes([0xFF, 0xFF, 0x88]))
-            kanal.las_block()  # klientens ACK
-            kanal.skicka_block(Blocktitel.ACK)
+    def _send_faults(self, channel: _ECUChannel) -> None:
+        """Send the fault memory, at most four codes per block."""
+        if not self.fault_memory:
+            channel.send_block(BlockTitle.FAULT_CODES, bytes([0xFF, 0xFF, 0x88]))
+            channel.read_block()  # the client's ACK
+            channel.send_block(BlockTitle.ACK)
             return
-        rader = list(self.felkoder)
-        for start in range(0, len(rader), 4):
-            bit = rader[start:start + 4]
+        entries = list(self.fault_memory)
+        for start in range(0, len(entries), 4):
+            chunk = entries[start:start + 4]
             data = bytearray()
-            for kod, status in bit:
-                data += bytes([(kod >> 8) & 0xFF, kod & 0xFF, status & 0xFF])
-            kanal.skicka_block(Blocktitel.FELKODER, bytes(data))
-            kanal.las_block()  # klientens ACK
-        kanal.skicka_block(Blocktitel.ACK)
+            for code, status in chunk:
+                data += bytes([(code >> 8) & 0xFF, code & 0xFF, status & 0xFF])
+            channel.send_block(BlockTitle.FAULT_CODES, bytes(data))
+            channel.read_block()  # the client's ACK
+        channel.send_block(BlockTitle.ACK)
 
-    def _svara_anpassning(self, kanal: _ECUKanal, kanal_nr: int, varde: int) -> None:
-        """Skicka ett 0xE6-svar med kanal, värde och tre mätvärden."""
-        data = bytearray([kanal_nr & 0xFF, (varde >> 8) & 0xFF, varde & 0xFF])
-        for trippel in (
-            formler.koda(1, self._varvtal(), a=100),
-            formler.koda(5, 85.0, a=10),
-            formler.koda(6, 13.8, a=100),
+    def _send_adaptation(
+        self, channel: _ECUChannel, number: int, value: int
+    ) -> None:
+        """Send a 0xE6 response carrying the channel, the value and three readings."""
+        data = bytearray([number & 0xFF, (value >> 8) & 0xFF, value & 0xFF])
+        for triplet in (
+            formulas.encode(1, self._engine_speed(), a=100),
+            formulas.encode(5, 85.0, a=10),
+            formulas.encode(6, 13.8, a=100),
         ):
-            data += bytes(trippel)
-        kanal.skicka_block(Blocktitel.ANPASSNINGSSVAR, bytes(data))
+            data += bytes(triplet)
+        channel.send_block(BlockTitle.ADAPTATION_RESPONSE, bytes(data))
 
-    # -- simulerade mätvärden ---------------------------------------------
+    # -- simulated measuring values ----------------------------------------
 
-    def _t(self) -> float:
-        """Sekunder sedan simulatorn startade."""
-        return self.klocka() - self._t0
+    def _elapsed(self) -> float:
+        """Seconds since the simulator started."""
+        return self.clock() - self._t0
 
-    def _varvtal(self) -> float:
-        """Varvtal som pendlar mellan tomgång och ca 3300 1/min."""
-        fas = math.sin(self._t() / 7.0)
-        return 850.0 + 1250.0 * (fas + 1.0)
+    def _engine_speed(self) -> float:
+        """Engine speed swinging between idle and roughly 3350 rpm."""
+        phase = math.sin(self._elapsed() / 7.0)
+        return 850.0 + 1250.0 * (phase + 1.0)
 
-    def _gaspadrag(self) -> float:
-        """Normaliserat gaspådrag 0–1 ur varvtalsprofilen."""
-        return max(0.0, min(1.0, (self._varvtal() - 850.0) / 2500.0))
+    def _throttle(self) -> float:
+        """Normalised throttle position 0-1 derived from the speed profile."""
+        return max(0.0, min(1.0, (self._engine_speed() - 850.0) / 2500.0))
 
-    def matgrupp(self, grupp: int) -> bytes:
-        """Bygg nyttolasten för ett mätvärdesblock (fyra värden om tre bytes)."""
-        rpm = self._varvtal()
-        gas = self._gaspadrag()
-        t = self._t()
+    def group_data(self, group: int) -> bytes:
+        """Build the payload of a measuring block (four values of three bytes)."""
+        rpm = self._engine_speed()
+        throttle = self._throttle()
+        t = self._elapsed()
 
-        if grupp == 1:
-            varden = [
-                formler.koda(1, rpm, a=100),
-                formler.koda(51, 8.0 + 42.0 * gas, a=40),
-                formler.koda(5, 84.0 + 2.0 * math.sin(t / 11.0), a=10),
-                formler.koda(2, 100.0 * gas, a=200),
+        if group == 1:
+            values = [
+                formulas.encode(1, rpm, a=100),
+                formulas.encode(51, 8.0 + 42.0 * throttle, a=40),
+                formulas.encode(5, 84.0 + 2.0 * math.sin(t / 11.0), a=10),
+                formulas.encode(2, 100.0 * throttle, a=200),
             ]
-        elif grupp == 2:
-            varden = [
-                formler.koda(1, rpm, a=100),
-                formler.koda(51, 8.0 + 42.0 * gas, a=40),
-                formler.koda(2, 100.0 * gas, a=200),
-                (16, 0xFF, 0b00000011 if gas < 0.05 else 0b00000001),
+        elif group == 2:
+            values = [
+                formulas.encode(1, rpm, a=100),
+                formulas.encode(51, 8.0 + 42.0 * throttle, a=40),
+                formulas.encode(2, 100.0 * throttle, a=200),
+                (16, 0xFF, 0b00000011 if throttle < 0.05 else 0b00000001),
             ]
-        elif grupp == 3:
-            # Luftmassa BÖR/ÄR i mg/slag plus EGR-styrgrad. Den simulerade bilen
-            # ligger lite lågt på ÄR-värdet vid full gas, precis som en sotig EGR.
-            bor = 320.0 + 560.0 * gas
-            ar = bor * (0.97 - 0.16 * gas)
-            varden = [
-                formler.koda(1, rpm, a=100),
-                formler.koda(51, bor, a=40),
-                formler.koda(51, ar, a=40),
-                formler.koda(2, max(0.0, 62.0 - 60.0 * gas), a=200),
+        elif group == 3:
+            # Air mass SPEC/ACTUAL in mg/stroke plus the EGR duty cycle. The
+            # simulated car reads a little low on ACTUAL at full throttle, just
+            # like a car with a sooted-up EGR system.
+            spec = 320.0 + 560.0 * throttle
+            actual = spec * (0.97 - 0.16 * throttle)
+            values = [
+                formulas.encode(1, rpm, a=100),
+                formulas.encode(51, spec, a=40),
+                formulas.encode(51, actual, a=40),
+                formulas.encode(2, max(0.0, 62.0 - 60.0 * throttle), a=200),
             ]
-        elif grupp == 4:
-            bor = 2.0 + 9.5 * gas
-            ar = bor - 0.4 * gas
-            varden = [
-                formler.koda(1, rpm, a=100),
-                formler.koda(4, bor, a=20),
-                formler.koda(4, ar, a=20),
-                formler.koda(2, 30.0 + 40.0 * gas, a=200),
+        elif group == 4:
+            spec = 2.0 + 9.5 * throttle
+            actual = spec - 0.4 * throttle
+            values = [
+                formulas.encode(1, rpm, a=100),
+                formulas.encode(4, spec, a=20),
+                formulas.encode(4, actual, a=20),
+                formulas.encode(2, 30.0 + 40.0 * throttle, a=200),
             ]
-        elif grupp == 11:
-            bor = 1000.0 + 1050.0 * gas
-            ar = bor - 90.0 * gas * gas
-            varden = [
-                formler.koda(1, rpm, a=100),
-                formler.koda(18, bor, a=200),
-                formler.koda(18, ar, a=200),
-                formler.koda(2, 20.0 + 65.0 * gas, a=200),
+        elif group == 11:
+            spec = 1000.0 + 1050.0 * throttle
+            actual = spec - 90.0 * throttle * throttle
+            values = [
+                formulas.encode(1, rpm, a=100),
+                formulas.encode(18, spec, a=200),
+                formulas.encode(18, actual, a=200),
+                formulas.encode(2, 20.0 + 65.0 * throttle, a=200),
             ]
-        elif grupp == 13:
-            avvikelser = [
+        elif group == 13:
+            deviations = [
                 1.4 * math.sin(t / 3.0),
                 -0.6 + 0.3 * math.sin(t / 5.0),
                 0.2 * math.sin(t / 4.0),
                 -0.9 + 0.4 * math.sin(t / 6.0),
             ]
-            # a=2 ger 0,2 mg/slag per steg – tillräckligt fint för att
-            # se en cylinder som avviker mer än ±2 mg/slag.
-            varden = [formler.koda(39, v, a=2) for v in avvikelser]
-        elif grupp in (5, 6, 7, 8, 9, 10, 12):
-            varden = [
-                formler.koda(1, rpm, a=100),
-                formler.koda(51, 8.0 + 42.0 * gas, a=40),
-                formler.koda(5, 84.0, a=10),
-                formler.koda(6, 13.9 - 0.4 * gas, a=100),
+            # a=2 gives 0.2 mg/stroke per step - fine enough to spot a cylinder
+            # deviating by more than +/-2 mg/stroke.
+            values = [formulas.encode(39, v, a=2) for v in deviations]
+        elif group in (5, 6, 7, 8, 9, 10, 12):
+            values = [
+                formulas.encode(1, rpm, a=100),
+                formulas.encode(51, 8.0 + 42.0 * throttle, a=40),
+                formulas.encode(5, 84.0, a=10),
+                formulas.encode(6, 13.9 - 0.4 * throttle, a=100),
             ]
         else:
-            return b""  # gruppen finns inte i det här styrdonet
+            return b""  # this module has no such group
 
         data = bytearray()
-        for trippel in varden:
-            data += bytes(trippel)
+        for triplet in values:
+            data += bytes(triplet)
         return bytes(data)
 
 
 # ---------------------------------------------------------------------------
-# Bekvämlighetsfunktion
+# Convenience helper
 # ---------------------------------------------------------------------------
 
 
 @dataclass
-class Simulatorkoppling:
-    """En startad simulator plus klienttransporten som pratar med den."""
+class SimulatorLink:
+    """A running simulator plus the client transport that talks to it."""
 
-    transport: Minnestransport
-    ecu: SimuleradECU
+    transport: MemoryTransport
+    ecu: SimulatedECU
 
-    def stang(self) -> None:
-        """Stoppa simulatorn och stäng transporten."""
-        self.ecu.stoppa()
-        self.transport.stang()
+    def close(self) -> None:
+        """Stop the simulator and close the transport."""
+        self.ecu.stop()
+        self.transport.close()
 
-    def __enter__(self) -> Simulatorkoppling:
+    def __enter__(self) -> SimulatorLink:
         return self
 
     def __exit__(self, *_exc: object) -> None:
-        self.stang()
+        self.close()
 
 
-def starta_simulator(adress: int = 0x01, **kw: object) -> Simulatorkoppling:
-    """Starta en virtuell ECU och returnera kopplingen till den."""
-    klient, ecu_transport = skapa_lankat_par()
-    ecu = SimuleradECU(ecu_transport, adress=adress, **kw)  # type: ignore[arg-type]
+def start_simulator(address: int = 0x01, **kw: object) -> SimulatorLink:
+    """Start a virtual ECU and return the link to it."""
+    client, ecu_transport = create_linked_pair()
+    ecu = SimulatedECU(ecu_transport, address=address, **kw)  # type: ignore[arg-type]
     ecu.start()
-    return Simulatorkoppling(transport=klient, ecu=ecu)
+    return SimulatorLink(transport=client, ecu=ecu)

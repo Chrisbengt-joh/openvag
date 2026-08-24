@@ -1,14 +1,14 @@
-"""Startpunkt för VAGDIAG.
+"""Entry point for VAGDIAG.
 
-Exempel::
+Examples::
 
-    python -m vagdiag COM3                     # meny
-    python -m vagdiag COM3 --autoscan          # scanna alla styrdon och avsluta
-    python -m vagdiag COM3 --felkoder          # läs felkoder ur motorstyrdonet
-    python -m vagdiag COM3 --grupper 3 4 11 --logg backe.csv
-    python -m vagdiag COM3 --gui               # tkinter-instrumentpanel
-    python -m vagdiag --simulator              # kör mot virtuell ECU, utan bil
-    python -m vagdiag --lista-portar
+    python -m vagdiag COM3                    # menu
+    python -m vagdiag COM3 --autoscan         # scan every module and exit
+    python -m vagdiag COM3 --faults           # read the engine fault codes
+    python -m vagdiag COM3 --groups 3 4 11 --log hill.csv
+    python -m vagdiag COM3 --gui              # tkinter dashboard
+    python -m vagdiag --simulator             # run against the virtual ECU
+    python -m vagdiag --list-ports
 """
 
 from __future__ import annotations
@@ -18,239 +18,238 @@ import sys
 from typing import Sequence
 
 from . import __version__
-from .meny import Meny, forbered_terminal, formatera_felkoder, rubrik, visa_fel
+from .exceptions import VagdiagError
+from .menu import Menu, format_faults, heading, setup_terminal, show_error
 from .transport import (
-    Serietransport,
+    SerialTransport,
     Transport,
-    las_ftdi_latens,
-    lista_portar,
-    pyserial_finns,
-    satt_ftdi_latens,
+    list_ports,
+    pyserial_available,
+    read_ftdi_latency,
+    set_ftdi_latency,
 )
-from .undantag import VagdiagFel
 
 __all__ = ["main"]
 
 
-def bygg_parser() -> argparse.ArgumentParser:
-    """Bygg argumentparsern."""
+def build_parser() -> argparse.ArgumentParser:
+    """Build the argument parser."""
     parser = argparse.ArgumentParser(
         prog="python -m vagdiag",
-        description="VAGDIAG – diagnos för äldre VAG-bilar över KWP1281/K-line.",
-        epilog="Hobbyverktyg – används på egen risk. VCDS är facit.",
+        description="VAGDIAG - diagnostics for older VAG cars over KWP1281/K-line.",
+        epilog="Hobby tool - use at your own risk. VCDS is the reference.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument(
         "port", nargs="?",
-        help="serieport till KKL-kabeln, t.ex. COM3 eller /dev/ttyUSB0",
+        help="serial port of the KKL cable, for example COM3 or /dev/ttyUSB0",
     )
     parser.add_argument(
         "--simulator", action="store_true",
-        help="kör mot den inbyggda virtuella ECU:n i stället för en riktig bil",
+        help="run against the built-in virtual ECU instead of a real car",
     )
     parser.add_argument(
         "--gui", action="store_true",
-        help="starta tkinter-instrumentpanelen i stället för terminalmenyn",
+        help="start the tkinter dashboard instead of the terminal menu",
     )
 
-    direkt = parser.add_argument_group("direktkörning utan meny")
-    direkt.add_argument(
-        "--autoscan", action="store_true", help="scanna alla styrdon och avsluta",
+    direct = parser.add_argument_group("direct commands (no menu)")
+    direct.add_argument(
+        "--autoscan", action="store_true", help="scan every module and exit",
     )
-    direkt.add_argument(
-        "--felkoder", action="store_true", help="läs felkoder och avsluta",
+    direct.add_argument(
+        "--faults", action="store_true", help="read the fault codes and exit",
     )
-    direkt.add_argument(
-        "--grupper", nargs="+", type=int, metavar="N",
-        help="läs mätgrupper live, t.ex. --grupper 3 4 11",
+    direct.add_argument(
+        "--groups", nargs="+", type=int, metavar="N",
+        help="live view of measuring blocks, for example --groups 3 4 11",
     )
-    direkt.add_argument(
-        "--styrdon", default="01", metavar="HEX",
-        help="styrdonsadress i hex för direktkörning (standard: 01 = motor)",
+    direct.add_argument(
+        "--module", default="01", metavar="HEX",
+        help="module address in hex for direct commands (default: 01 = engine)",
     )
-    direkt.add_argument("--logg", metavar="FIL", help="CSV-fil att logga till")
+    direct.add_argument("--log", metavar="FILE", help="CSV file to log into")
 
-    ovrigt = parser.add_argument_group("övrigt")
-    ovrigt.add_argument(
-        "--lista-portar", action="store_true", help="visa tillgängliga serieportar",
+    other = parser.add_argument_group("other")
+    other.add_argument(
+        "--list-ports", action="store_true", help="show the available serial ports",
     )
-    ovrigt.add_argument(
-        "--satt-latens", action="store_true",
-        help="försök sätta FTDI Latency Timer till 1 ms (Windows, kräver admin)",
+    other.add_argument(
+        "--set-latency", action="store_true",
+        help="try to set the FTDI latency timer to 1 ms (Windows, needs admin)",
     )
-    ovrigt.add_argument(
+    other.add_argument(
         "--timeout", type=float, default=1.0, metavar="S",
-        help="timeout per byte i sekunder (standard: 1.0)",
+        help="per-byte timeout in seconds (default: 1.0)",
     )
-    ovrigt.add_argument(
+    other.add_argument(
         "--init-timeout", type=float, default=2.0, metavar="S",
-        help="timeout för svar på 5-baud-init (standard: 2.0)",
+        help="timeout for the answer to the 5-baud init (default: 2.0)",
     )
-    ovrigt.add_argument(
-        "--intervall", type=float, default=0.0, metavar="S",
-        help="paus mellan avläsningsvarv i liveläget (standard: 0 = så snabbt det går)",
+    other.add_argument(
+        "--interval", type=float, default=0.0, metavar="S",
+        help="pause between polling cycles in the live view (default: 0 = as fast "
+        "as possible)",
     )
-    ovrigt.add_argument(
-        "--csv-punkt", action="store_true",
-        help="skriv CSV med komma och decimalpunkt i stället för svensk Excel-stil",
+    other.add_argument(
+        "--csv-dot", action="store_true",
+        help="write CSV with commas and a decimal point instead of the "
+        "European Excel style",
     )
-    ovrigt.add_argument(
-        "--debug", action="store_true", help="skriv all blocktrafik till stderr",
+    other.add_argument(
+        "--debug", action="store_true", help="trace all block traffic to stderr",
     )
-    ovrigt.add_argument("--version", action="version", version=f"VAGDIAG {__version__}")
+    other.add_argument("--version", action="version", version=f"VAGDIAG {__version__}")
     return parser
 
 
-def _visa_portar() -> int:
-    """Lista serieportar med FTDI-latens där den går att läsa."""
-    if not pyserial_finns():
-        print("pyserial är inte installerat. Kör: pip install pyserial")
+def _show_ports() -> int:
+    """List the serial ports, with the FTDI latency where it can be read."""
+    if not pyserial_available():
+        print("pyserial is not installed. Run: pip install pyserial")
         return 1
-    portar = lista_portar()
-    if not portar:
-        print("Inga serieportar hittades.")
-        print("Koppla in KKL-kabeln och kontrollera att den syns i")
-        print("Enhetshanteraren under \"Portar (COM & LPT)\".")
+    ports = list_ports()
+    if not ports:
+        print("No serial ports found.")
+        print("Plug in the KKL cable and check that it shows up in Device")
+        print("Manager under \"Ports (COM & LPT)\".")
         return 1
-    print(rubrik("SERIEPORTAR"))
-    for namn, beskrivning in portar:
-        latens = las_ftdi_latens(namn)
-        latenstext = ""
-        if latens is not None:
-            latenstext = f"  [FTDI Latency Timer: {latens} ms" + (
-                "]" if latens <= 2 else " – SÄTT TILL 1!]"
+    print(heading("SERIAL PORTS"))
+    for name, description in ports:
+        latency = read_ftdi_latency(name)
+        latency_text = ""
+        if latency is not None:
+            latency_text = f"  [FTDI latency timer: {latency} ms" + (
+                "]" if latency <= 2 else " - SET IT TO 1!]"
             )
-        print(f"  {namn:<10} {beskrivning}{latenstext}")
+        print(f"  {name:<10} {description}{latency_text}")
     return 0
 
 
-def _satt_latens(port: str | None) -> int:
-    """Försök sätta latensen till 1 ms för angiven port."""
+def _set_latency(port: str | None) -> int:
+    """Try to set the latency timer to 1 ms for the given port."""
     if not port:
-        print("Ange vilken port det gäller, t.ex.: "
-              "python -m vagdiag COM3 --satt-latens")
+        print("Name the port, for example: python -m vagdiag COM3 --set-latency")
         return 2
-    if satt_ftdi_latens(port, 1):
-        print(f"Latency Timer för {port} satt till 1 ms.")
-        print("Koppla ur och i USB-kabeln (eller starta om) för att det ska gälla.")
+    if set_ftdi_latency(port, 1):
+        print(f"Latency timer for {port} set to 1 ms.")
+        print("Unplug and replug the USB cable (or reboot) for it to take effect.")
         return 0
-    print(f"Kunde inte skriva Latency Timer för {port}.")
-    print("Kör terminalen som administratör, eller sätt den manuellt:")
-    print("  Enhetshanteraren -> Portar (COM & LPT) -> USB Serial Port ->")
-    print("  Egenskaper -> Portinställningar -> Avancerat -> Latency Timer = 1")
+    print(f"Could not write the latency timer for {port}.")
+    print("Run the terminal as administrator, or set it manually:")
+    print("  Device Manager -> Ports (COM & LPT) -> USB Serial Port ->")
+    print("  Properties -> Port Settings -> Advanced -> Latency Timer = 1")
     return 1
 
 
-def _oppna_transport(args: argparse.Namespace) -> tuple[Transport, object | None]:
-    """Öppna transporten. Returnerar (transport, simulatorkoppling eller None)."""
+def _open_transport(args: argparse.Namespace) -> tuple[Transport, object | None]:
+    """Open the transport. Returns (transport, simulator link or None)."""
     if args.simulator:
-        from .simulator import starta_simulator
+        from .simulator import start_simulator
 
-        koppling = starta_simulator()
-        print("Kör mot den virtuella ECU:n (ingen bil inblandad).")
-        return koppling.transport, koppling
+        link = start_simulator()
+        print("Running against the virtual ECU (no car involved).")
+        return link.transport, link
     if not args.port:
-        raise VagdiagFel(
-            "Ingen serieport angiven.",
-            tips="Kör 'python -m vagdiag --lista-portar' för att se dina portar, "
-            "eller 'python -m vagdiag --simulator' för att prova utan bil.",
+        raise VagdiagError(
+            "No serial port given.",
+            hint="Run 'python -m vagdiag --list-ports' to see your ports, or "
+            "'python -m vagdiag --simulator' to try it without a car.",
         )
-    return Serietransport(
-        args.port, timeout=args.timeout,
-    ), None
+    return SerialTransport(args.port, timeout=args.timeout), None
 
 
-def _direktkorning(meny: Meny, args: argparse.Namespace) -> int:
-    """Utför --autoscan/--felkoder/--grupper utan att visa menyn."""
+def _run_direct(menu: Menu, args: argparse.Namespace) -> int:
+    """Run --autoscan/--faults/--groups without showing the menu."""
     if args.autoscan:
-        meny.autoscan()
+        menu.autoscan()
         return 0
 
     try:
-        adress = int(args.styrdon, 16)
+        address = int(args.module, 16)
     except ValueError:
-        print(f"Ogiltig styrdonsadress: {args.styrdon}")
+        print(f"Invalid module address: {args.module}")
         return 2
 
-    meny.anslut(adress)
-    klient = meny.klient
-    assert klient is not None
+    menu.connect(address)
+    client = menu.client
+    assert client is not None
 
-    if args.felkoder:
-        print(rubrik("FELKODER"))
-        for rad in formatera_felkoder(klient.las_felkoder()):
-            print(rad)
+    if args.faults:
+        print(heading("FAULT CODES"))
+        for line in format_faults(client.read_faults()):
+            print(line)
         return 0
 
-    if args.grupper:
-        grupper = [g for g in args.grupper if 1 <= g <= 255]
-        if not grupper:
-            print("Inga giltiga grupper angivna (1-255).")
+    if args.groups:
+        groups = [g for g in args.groups if 1 <= g <= 255]
+        if not groups:
+            print("No valid groups given (1-255).")
             return 2
-        meny.live(klient, grupper, args.logg)
+        menu.live(client, groups, args.log)
         return 0
     return 0
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    """Kör VAGDIAG. Returnerar processens exitkod."""
-    forbered_terminal()
-    parser = bygg_parser()
+    """Run VAGDIAG. Returns the process exit code."""
+    setup_terminal()
+    parser = build_parser()
     args = parser.parse_args(argv)
 
-    if args.lista_portar:
-        return _visa_portar()
-    if args.satt_latens:
-        return _satt_latens(args.port)
+    if args.list_ports:
+        return _show_ports()
+    if args.set_latency:
+        return _set_latency(args.port)
 
-    spar = None
+    trace = None
     if args.debug:
-        def spar(text: str) -> None:
+        def trace(text: str) -> None:
             print(text, file=sys.stderr)
 
-    koppling = None
+    link = None
     try:
-        transport, koppling = _oppna_transport(args)
-    except VagdiagFel as fel:
-        visa_fel(fel)
+        transport, link = _open_transport(args)
+    except VagdiagError as error:
+        show_error(error)
         return 2
 
-    meny = Meny(
+    menu = Menu(
         transport,
-        spar=spar,
-        avgransare="," if args.csv_punkt else ";",
-        decimalkomma=not args.csv_punkt,
-        intervall=args.intervall,
+        trace=trace,
+        delimiter="," if args.csv_dot else ";",
+        decimal_comma=not args.csv_dot,
+        interval=args.interval,
         timeout=args.timeout,
         init_timeout=args.init_timeout,
     )
 
     try:
         if args.gui:
-            from .gui import kor_gui
+            from .gui import run_gui
 
             try:
-                gui_adress = int(args.styrdon, 16)
+                gui_address = int(args.module, 16)
             except ValueError:
-                print(f"Ogiltig styrdonsadress: {args.styrdon}")
+                print(f"Invalid module address: {args.module}")
                 return 2
-            gui_grupper = [g for g in (args.grupper or [3, 11]) if 1 <= g <= 255]
-            return kor_gui(meny, gui_adress, gui_grupper or [3, 11])
-        if args.autoscan or args.felkoder or args.grupper:
-            return _direktkorning(meny, args)
-        return meny.kor()
-    except VagdiagFel as fel:
-        visa_fel(fel)
+            gui_groups = [g for g in (args.groups or [3, 11]) if 1 <= g <= 255]
+            return run_gui(menu, gui_address, gui_groups or [3, 11])
+        if args.autoscan or args.faults or args.groups:
+            return _run_direct(menu, args)
+        return menu.run()
+    except VagdiagError as error:
+        show_error(error)
         return 2
     except KeyboardInterrupt:
-        print("\nAvbrutet.")
+        print("\nInterrupted.")
         return 130
     finally:
-        meny.koppla_ner()
-        if koppling is not None:
-            koppling.stang()  # type: ignore[attr-defined]
+        menu.disconnect()
+        if link is not None:
+            link.close()  # type: ignore[attr-defined]
         else:
-            transport.stang()
+            transport.close()
 
 
 if __name__ == "__main__":

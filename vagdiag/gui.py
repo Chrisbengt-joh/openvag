@@ -1,12 +1,13 @@
-"""tkinter-instrumentpanel för VAGDIAG (fas 2).
+"""tkinter dashboard for VAGDIAG (phase 2).
 
-Trådmodell
-----------
-All seriekommunikation sker i :class:`Diagnostrad`. Den tråden rör **aldrig**
-tkinter. Resultat läggs i en :class:`queue.Queue` som GUI-tråden tömmer via
-``after()``. Kommandon åt andra hållet (läs felkoder, radera, byt grupper,
-starta/stoppa loggning) går genom en andra kö. Därför kan GUI:t aldrig frysa
-av en långsam eller död K-line, och serietråden kan aldrig krascha tkinter.
+Threading model
+---------------
+All serial communication happens in :class:`DiagnosticThread`. That thread
+**never** touches tkinter. Results are put on a :class:`queue.Queue` which the
+GUI thread drains from ``after()``. Commands going the other way (read faults,
+clear faults, change groups, start/stop logging) travel through a second queue.
+As a result the GUI can never freeze on a slow or dead K-line, and the serial
+thread can never crash tkinter.
 """
 
 from __future__ import annotations
@@ -21,691 +22,697 @@ from datetime import datetime
 from tkinter import messagebox, simpledialog, ttk
 from typing import Sequence
 
-from .felkoder import Felkod
-from .formler import Matvarde
-from .kwp1281 import Identifikation
-from .loggning import CsvLogg
-from .meny import Meny
-from .styrdon import etikett, gruppnamn, styrdonsnamn
-from .undantag import VagdiagFel
+from .datalog import CsvLogger
+from .exceptions import VagdiagError
+from .faults import FaultCode
+from .formulas import Reading
+from .kwp1281 import Identification
+from .menu import Menu
+from .modules import group_name, label, module_name
 
-__all__ = ["kor_gui", "Instrumentpanel", "Diagnostrad"]
+__all__ = ["run_gui", "Dashboard", "DiagnosticThread"]
 
-# Färger – mörk panel är lättare att läsa i en bil.
-BAKGRUND = "#12141a"
+# Colours - a dark panel is easier to read inside a car.
+BACKGROUND = "#12141a"
 PANEL = "#1b1f2a"
 TEXT = "#e6e9f0"
-DAMPAD = "#8b93a7"
-AR_FARG = "#4da3ff"      # ÄR-värde
-BOR_FARG = "#ffb454"     # BÖR-värde
-LARM = "#ff5f56"
-OK_FARG = "#3ddc84"
+MUTED = "#8b93a7"
+ACTUAL_COLOUR = "#4da3ff"
+SPEC_COLOUR = "#ffb454"
+ALERT = "#ff5f56"
+OK_COLOUR = "#3ddc84"
 
-SERIEFARGER = [
+SERIES_COLOURS = [
     "#4da3ff", "#ffb454", "#3ddc84", "#ff5f56",
     "#c792ea", "#89ddff", "#f78c6c", "#a3be8c",
 ]
 
-#: Hur många sekunder den rullande grafen visar.
-GRAFFONSTER = 60.0
+#: How many seconds the scrolling chart shows.
+CHART_WINDOW = 60.0
 
 
 # ---------------------------------------------------------------------------
-# Meddelanden mellan trådarna
+# Messages between the threads
 # ---------------------------------------------------------------------------
 
 
 @dataclass
-class Matning:
-    """Ett avläsningsvarv."""
+class Measurement:
+    """One polling cycle."""
 
-    tid: float
-    varden: dict[int, list[Matvarde]] = field(default_factory=dict)
+    time: float
+    values: dict[int, list[Reading]] = field(default_factory=dict)
 
 
 @dataclass
-class Status:
-    """Statusrad till GUI:t."""
+class StatusMessage:
+    """A line for the status bar."""
 
     text: str
-    fel: bool = False
+    error: bool = False
 
 
 # ---------------------------------------------------------------------------
-# Serietråden
+# The serial thread
 # ---------------------------------------------------------------------------
 
 
-class Diagnostrad(threading.Thread):
-    """Sköter all ECU-kommunikation. Får aldrig röra tkinter."""
+class DiagnosticThread(threading.Thread):
+    """Owns all ECU communication. Must never touch tkinter."""
 
     def __init__(
         self,
-        meny: Meny,
-        adress: int,
-        grupper: Sequence[int],
-        ut: queue.Queue[object],
+        menu: Menu,
+        address: int,
+        groups: Sequence[int],
+        out: queue.Queue[object],
     ) -> None:
-        super().__init__(name="vagdiag-serie", daemon=True)
-        self.meny = meny
-        self.adress = adress
-        self.grupper = list(grupper)
-        self.ut = ut
-        self.inkommande: queue.Queue[tuple[str, object]] = queue.Queue()
-        self._stopp = threading.Event()
-        self._logg: CsvLogg | None = None
-        self._pausad = False
+        super().__init__(name="vagdiag-serial", daemon=True)
+        self.menu = menu
+        self.address = address
+        self.groups = list(groups)
+        self.out = out
+        self.incoming: queue.Queue[tuple[str, object]] = queue.Queue()
+        self._stop_event = threading.Event()
+        self._logger: CsvLogger | None = None
+        self._paused = False
 
-    # -- kommandon från GUI-tråden ----------------------------------------
+    # -- commands from the GUI thread --------------------------------------
 
-    def kommando(self, namn: str, data: object = None) -> None:
-        """Köa ett kommando till serietråden."""
-        self.inkommande.put((namn, data))
+    def command(self, name: str, data: object = None) -> None:
+        """Queue a command for the serial thread."""
+        self.incoming.put((name, data))
 
-    def stoppa(self) -> None:
-        """Avsluta tråden och vänta in den."""
-        self._stopp.set()
+    def stop(self) -> None:
+        """Finish the thread and join it."""
+        self._stop_event.set()
         if self.is_alive() and threading.current_thread() is not self:
             self.join(timeout=4.0)
 
-    # -- huvudloop ---------------------------------------------------------
+    # -- main loop ---------------------------------------------------------
 
     def run(self) -> None:
-        klient = None
+        client = None
         try:
-            self.ut.put(Status(
-                f"Väcker 0x{self.adress:02X} {styrdonsnamn(self.adress)} ..."
+            self.out.put(StatusMessage(
+                f"Waking 0x{self.address:02X} {module_name(self.address)} ..."
             ))
-            klient = self.meny.ny_klient()
-            ident = klient.anslut(self.adress)
-            klient.starta_keepalive()
-            self.ut.put(ident)
-            self.ut.put(Status(f"Ansluten: {ident.sammanfattning()}"))
+            client = self.menu.new_client()
+            ident = client.connect(self.address)
+            client.start_keepalive()
+            self.out.put(ident)
+            self.out.put(StatusMessage(f"Connected: {ident.summary()}"))
 
-            while not self._stopp.is_set():
-                self._hantera_kommandon(klient)
-                if self._stopp.is_set():
+            while not self._stop_event.is_set():
+                self._handle_commands(client)
+                if self._stop_event.is_set():
                     break
-                if self._pausad or not self.grupper:
-                    klient.keep_alive()
+                if self._paused or not self.groups:
+                    client.keep_alive()
                     time.sleep(0.2)
                     continue
-                matning = Matning(tid=time.monotonic())
-                for grupp in self.grupper:
-                    matning.varden[grupp] = klient.las_matgrupp(grupp)
-                if self._logg is not None:
-                    self._logg.logga(matning.varden)
-                self.ut.put(matning)
-                if self.meny.intervall:
-                    time.sleep(self.meny.intervall)
-        except VagdiagFel as fel:
-            self.ut.put(fel)
-        except Exception as fel:  # oväntat – visa ändå något begripligt
-            self.ut.put(VagdiagFel(f"Oväntat fel i serietråden: {fel!r}"))
+                measurement = Measurement(time=time.monotonic())
+                for group in self.groups:
+                    measurement.values[group] = client.read_group(group)
+                if self._logger is not None:
+                    self._logger.log(measurement.values)
+                self.out.put(measurement)
+                if self.menu.interval:
+                    time.sleep(self.menu.interval)
+        except VagdiagError as error:
+            self.out.put(error)
+        except Exception as error:  # unexpected - still show something readable
+            self.out.put(VagdiagError(f"Unexpected error in the serial thread: {error!r}"))
         finally:
-            self._stang_logg()
-            if klient is not None:
+            self._close_log()
+            if client is not None:
                 try:
-                    klient.koppla_ner()
-                except VagdiagFel:
+                    client.disconnect()
+                except VagdiagError:
                     pass
-            self.ut.put(Status("Frånkopplad."))
+            self.out.put(StatusMessage("Disconnected."))
 
-    def _hantera_kommandon(self, klient) -> None:
-        """Töm kommandokön."""
+    def _handle_commands(self, client) -> None:
+        """Drain the command queue."""
         while True:
             try:
-                namn, data = self.inkommande.get_nowait()
+                name, data = self.incoming.get_nowait()
             except queue.Empty:
                 return
-            if namn == "grupper":
-                self.grupper = list(data)  # type: ignore[arg-type]
-                self._byt_logg_grupper()
-            elif namn == "paus":
-                self._pausad = bool(data)
-            elif namn == "las_felkoder":
-                self.ut.put(("felkoder", klient.las_felkoder()))
-            elif namn == "radera_felkoder":
-                klient.radera_felkoder()
-                self.ut.put(Status("Felkodsminnet raderat."))
-                self.ut.put(("felkoder", klient.las_felkoder()))
-            elif namn == "logg_start":
-                self._starta_logg(str(data))
-            elif namn == "logg_stopp":
-                self._stang_logg()
-            elif namn == "stopp":
-                self._stopp.set()
+            if name == "groups":
+                self.groups = list(data)  # type: ignore[arg-type]
+                self._reset_log_groups()
+            elif name == "pause":
+                self._paused = bool(data)
+            elif name == "read_faults":
+                self.out.put(("faults", client.read_faults()))
+            elif name == "clear_faults":
+                client.clear_faults()
+                self.out.put(StatusMessage("Fault memory cleared."))
+                self.out.put(("faults", client.read_faults()))
+            elif name == "log_start":
+                self._start_log(str(data))
+            elif name == "log_stop":
+                self._close_log()
+            elif name == "stop":
+                self._stop_event.set()
                 return
 
-    # -- loggning ----------------------------------------------------------
+    # -- logging -----------------------------------------------------------
 
-    def _starta_logg(self, filnamn: str) -> None:
-        self._stang_logg()
-        self._logg = CsvLogg(
-            filnamn, self.grupper, self.adress,
-            avgransare=self.meny.avgransare,
-            decimalkomma=self.meny.decimalkomma,
+    def _start_log(self, filename: str) -> None:
+        self._close_log()
+        self._logger = CsvLogger(
+            filename, self.groups, self.address,
+            delimiter=self.menu.delimiter,
+            decimal_comma=self.menu.decimal_comma,
         )
-        self.ut.put(Status(f"Loggar till {filnamn}"))
+        self.out.put(StatusMessage(f"Logging to {filename}"))
 
-    def _byt_logg_grupper(self) -> None:
-        """Grupperna ändrades – en pågående logg måste börja på ny fil."""
-        if self._logg is None:
+    def _reset_log_groups(self) -> None:
+        """The groups changed - a running log has to start a new file."""
+        if self._logger is None:
             return
-        gammal = self._logg.filnamn
-        self._stang_logg()
-        self.ut.put(Status(
-            f"Grupperna ändrades – loggen {gammal.name} stängdes. Starta en ny."
+        old = self._logger.filename
+        self._close_log()
+        self.out.put(StatusMessage(
+            f"Groups changed - the log {old.name} was closed. Start a new one."
         ))
 
-    def _stang_logg(self) -> None:
-        if self._logg is not None:
-            namn, rader = self._logg.filnamn, self._logg.rader
-            self._logg.stang()
-            self._logg = None
-            self.ut.put(Status(f"Logg sparad: {namn} ({rader} rader)"))
+    def _close_log(self) -> None:
+        if self._logger is not None:
+            name, rows = self._logger.filename, self._logger.rows
+            self._logger.close()
+            self._logger = None
+            self.out.put(StatusMessage(f"Log saved: {name} ({rows} rows)"))
 
     @property
-    def loggar(self) -> bool:
-        """True om loggning pågår."""
-        return self._logg is not None
+    def logging(self) -> bool:
+        """True while logging is active."""
+        return self._logger is not None
 
 
 # ---------------------------------------------------------------------------
-# Mätare
+# Gauge
 # ---------------------------------------------------------------------------
 
 
-class Matare(tk.Canvas):
-    """Rund mätartavla med visare för ÄR-värde och (valfritt) BÖR-värde."""
+class Gauge(tk.Canvas):
+    """Round gauge with a needle for the actual value and an optional spec needle."""
 
     def __init__(
         self,
         master: tk.Misc,
-        rubrik: str,
-        minvarde: float,
-        maxvarde: float,
-        enhet: str,
-        storlek: int = 190,
+        title: str,
+        minimum: float,
+        maximum: float,
+        unit: str,
+        size: int = 190,
     ) -> None:
         super().__init__(
-            master, width=storlek, height=storlek,
-            bg=PANEL, highlightthickness=0,
+            master, width=size, height=size, bg=PANEL, highlightthickness=0,
         )
-        self.rubrik = rubrik
-        self.minvarde = minvarde
-        self.maxvarde = maxvarde
-        self.enhet = enhet
-        self.storlek = storlek
-        self._rita_skala()
-        self._visare_ar: int | None = None
-        self._visare_bor: int | None = None
-        self._text_ar = self.create_text(
-            storlek / 2, storlek * 0.70, text="–",
+        self.title = title
+        self.minimum = minimum
+        self.maximum = maximum
+        self.unit = unit
+        self.size = size
+        self._draw_scale()
+        self._needle_actual: int | None = None
+        self._needle_spec: int | None = None
+        self._text_actual = self.create_text(
+            size / 2, size * 0.70, text="-",
             fill=TEXT, font=("Segoe UI", 15, "bold"),
         )
-        self._text_bor = self.create_text(
-            storlek / 2, storlek * 0.83, text="",
-            fill=BOR_FARG, font=("Segoe UI", 9),
+        self._text_spec = self.create_text(
+            size / 2, size * 0.83, text="",
+            fill=SPEC_COLOUR, font=("Segoe UI", 9),
         )
 
-    # -- ritning -----------------------------------------------------------
+    # -- drawing -----------------------------------------------------------
 
-    def _rita_skala(self) -> None:
-        s = self.storlek
-        marginal = s * 0.10
+    def _draw_scale(self) -> None:
+        s = self.size
+        margin = s * 0.10
         self.create_arc(
-            marginal, marginal, s - marginal, s - marginal,
+            margin, margin, s - margin, s - margin,
             start=-45, extent=270, style=tk.ARC, outline="#2c3242", width=10,
         )
         for i in range(11):
-            andel = i / 10
-            vinkel = math.radians(225 - 270 * andel)
-            r_yttre = s / 2 - marginal * 0.7
-            r_inre = r_yttre - (s * 0.045 if i % 5 == 0 else s * 0.025)
-            mitt = s / 2
+            fraction = i / 10
+            angle = math.radians(225 - 270 * fraction)
+            outer = s / 2 - margin * 0.7
+            inner = outer - (s * 0.045 if i % 5 == 0 else s * 0.025)
+            centre = s / 2
             self.create_line(
-                mitt + r_inre * math.cos(vinkel), mitt - r_inre * math.sin(vinkel),
-                mitt + r_yttre * math.cos(vinkel), mitt - r_yttre * math.sin(vinkel),
-                fill=DAMPAD, width=2 if i % 5 == 0 else 1,
+                centre + inner * math.cos(angle), centre - inner * math.sin(angle),
+                centre + outer * math.cos(angle), centre - outer * math.sin(angle),
+                fill=MUTED, width=2 if i % 5 == 0 else 1,
             )
         self.create_text(
-            s / 2, s * 0.20, text=self.rubrik, fill=DAMPAD,
+            s / 2, s * 0.20, text=self.title, fill=MUTED,
             font=("Segoe UI", 10, "bold"),
         )
         self.create_text(
-            s / 2, s * 0.93, text=self.enhet, fill=DAMPAD, font=("Segoe UI", 8),
+            s / 2, s * 0.93, text=self.unit, fill=MUTED, font=("Segoe UI", 8),
         )
 
-    def _visarpunkt(self, varde: float, langd: float) -> tuple[float, float, float, float]:
-        omfang = self.maxvarde - self.minvarde or 1.0
-        andel = min(1.0, max(0.0, (varde - self.minvarde) / omfang))
-        vinkel = math.radians(225 - 270 * andel)
-        mitt = self.storlek / 2
-        r = self.storlek / 2 * langd
-        return mitt, mitt, mitt + r * math.cos(vinkel), mitt - r * math.sin(vinkel)
+    def _needle_points(
+        self, value: float, length: float
+    ) -> tuple[float, float, float, float]:
+        span = self.maximum - self.minimum or 1.0
+        fraction = min(1.0, max(0.0, (value - self.minimum) / span))
+        angle = math.radians(225 - 270 * fraction)
+        centre = self.size / 2
+        r = self.size / 2 * length
+        return centre, centre, centre + r * math.cos(angle), centre - r * math.sin(angle)
 
-    def uppdatera(self, ar: float | None, bor: float | None = None) -> None:
-        """Rita om visarna. None döljer respektive visare."""
-        for handtag in (self._visare_bor, self._visare_ar):
-            if handtag is not None:
-                self.delete(handtag)
-        self._visare_bor = None
-        self._visare_ar = None
+    def update_values(self, actual: float | None, spec: float | None = None) -> None:
+        """Redraw the needles. None hides the respective needle."""
+        for handle in (self._needle_spec, self._needle_actual):
+            if handle is not None:
+                self.delete(handle)
+        self._needle_spec = None
+        self._needle_actual = None
 
-        if bor is not None:
-            self._visare_bor = self.create_line(
-                *self._visarpunkt(bor, 0.66), fill=BOR_FARG, width=3,
+        if spec is not None:
+            self._needle_spec = self.create_line(
+                *self._needle_points(spec, 0.66), fill=SPEC_COLOUR, width=3,
             )
-            self.itemconfigure(self._text_bor, text=f"BÖR {bor:,.0f}".replace(",", " "))
-        else:
-            self.itemconfigure(self._text_bor, text="")
-
-        if ar is not None:
-            self._visare_ar = self.create_line(
-                *self._visarpunkt(ar, 0.72), fill=AR_FARG, width=4,
+            self.itemconfigure(
+                self._text_spec, text=f"SPEC {spec:,.0f}".replace(",", " ")
             )
-            self.itemconfigure(self._text_ar, text=f"{ar:,.0f}".replace(",", " "))
         else:
-            self.itemconfigure(self._text_ar, text="–")
+            self.itemconfigure(self._text_spec, text="")
+
+        if actual is not None:
+            self._needle_actual = self.create_line(
+                *self._needle_points(actual, 0.72), fill=ACTUAL_COLOUR, width=4,
+            )
+            self.itemconfigure(
+                self._text_actual, text=f"{actual:,.0f}".replace(",", " ")
+            )
+        else:
+            self.itemconfigure(self._text_actual, text="-")
 
 
 # ---------------------------------------------------------------------------
-# Rullande graf
+# Scrolling chart
 # ---------------------------------------------------------------------------
 
 
-class Rullgraf(tk.Canvas):
-    """Realtidsgraf över de senaste ``GRAFFONSTER`` sekunderna.
+class ScrollingChart(tk.Canvas):
+    """Real-time chart of the last ``CHART_WINDOW`` seconds.
 
-    Varje serie skalas mot sitt eget min/max i fönstret, eftersom varvtal och
-    laddtryck inte går att lägga på samma axel. Aktuellt värde står i förklaringen.
+    Each series is scaled against its own min/max within the window, because
+    engine speed and charge pressure cannot share one axis. The current value
+    is shown in the legend.
     """
 
-    def __init__(self, master: tk.Misc, hojd: int = 220) -> None:
-        super().__init__(master, height=hojd, bg=PANEL, highlightthickness=0)
-        self._punkter: list[tuple[float, dict[str, tuple[float, str]]]] = []
-        self.bind("<Configure>", lambda _h: self.rita())
+    def __init__(self, master: tk.Misc, height: int = 220) -> None:
+        super().__init__(master, height=height, bg=PANEL, highlightthickness=0)
+        self._points: list[tuple[float, dict[str, tuple[float, str]]]] = []
+        self.bind("<Configure>", lambda _e: self.redraw())
 
-    def lagg_till(self, tid: float, serier: dict[str, tuple[float, str]]) -> None:
-        """Lägg till ett mätvarv: {etikett: (värde, enhet)}."""
-        self._punkter.append((tid, serier))
-        grans = tid - GRAFFONSTER
-        while self._punkter and self._punkter[0][0] < grans:
-            self._punkter.pop(0)
+    def add(self, moment: float, series: dict[str, tuple[float, str]]) -> None:
+        """Add one cycle: {label: (value, unit)}."""
+        self._points.append((moment, series))
+        cutoff = moment - CHART_WINDOW
+        while self._points and self._points[0][0] < cutoff:
+            self._points.pop(0)
 
-    def rensa(self) -> None:
-        """Töm grafen."""
-        self._punkter.clear()
-        self.rita()
+    def clear(self) -> None:
+        """Empty the chart."""
+        self._points.clear()
+        self.redraw()
 
-    def rita(self) -> None:
-        """Rita om hela grafen."""
+    def redraw(self) -> None:
+        """Repaint the whole chart."""
         self.delete("all")
-        bredd = max(self.winfo_width(), 10)
-        hojd = max(self.winfo_height(), 10)
-        vanster, hoger, uppe, nere = 8, bredd - 150, 12, hojd - 20
+        width = max(self.winfo_width(), 10)
+        height = max(self.winfo_height(), 10)
+        left, right, top, bottom = 8, width - 150, 12, height - 20
 
         for i in range(5):
-            y = uppe + (nere - uppe) * i / 4
-            self.create_line(vanster, y, hoger, y, fill="#252b38")
+            y = top + (bottom - top) * i / 4
+            self.create_line(left, y, right, y, fill="#252b38")
         self.create_text(
-            vanster + 4, nere + 10, anchor="w",
-            text=f"senaste {GRAFFONSTER:.0f} s", fill=DAMPAD, font=("Segoe UI", 8),
+            left + 4, bottom + 10, anchor="w",
+            text=f"last {CHART_WINDOW:.0f} s", fill=MUTED, font=("Segoe UI", 8),
         )
-        if len(self._punkter) < 2:
+        if len(self._points) < 2:
             self.create_text(
-                (vanster + hoger) / 2, (uppe + nere) / 2,
-                text="samlar mätvärden ...", fill=DAMPAD, font=("Segoe UI", 10),
+                (left + right) / 2, (top + bottom) / 2,
+                text="collecting measurements ...", fill=MUTED,
+                font=("Segoe UI", 10),
             )
             return
 
-        t_slut = self._punkter[-1][0]
-        t_start = t_slut - GRAFFONSTER
-        namn = list(self._punkter[-1][1].keys())
+        end = self._points[-1][0]
+        start = end - CHART_WINDOW
+        names = list(self._points[-1][1].keys())
 
-        for index, serienamn in enumerate(namn):
-            farg = SERIEFARGER[index % len(SERIEFARGER)]
-            varden = [
-                (t, s[serienamn][0]) for t, s in self._punkter if serienamn in s
-            ]
-            if len(varden) < 2:
+        for index, name in enumerate(names):
+            colour = SERIES_COLOURS[index % len(SERIES_COLOURS)]
+            values = [(t, s[name][0]) for t, s in self._points if name in s]
+            if len(values) < 2:
                 continue
-            lagsta = min(v for _t, v in varden)
-            hogsta = max(v for _t, v in varden)
-            omfang = (hogsta - lagsta) or 1.0
-            koordinater: list[float] = []
-            for t, v in varden:
-                x = vanster + (hoger - vanster) * (t - t_start) / GRAFFONSTER
-                y = nere - (nere - uppe) * (v - lagsta) / omfang
-                koordinater.extend((max(vanster, x), y))
-            self.create_line(*koordinater, fill=farg, width=2, smooth=True)
+            lowest = min(v for _t, v in values)
+            highest = max(v for _t, v in values)
+            span = (highest - lowest) or 1.0
+            coordinates: list[float] = []
+            for t, v in values:
+                x = left + (right - left) * (t - start) / CHART_WINDOW
+                y = bottom - (bottom - top) * (v - lowest) / span
+                coordinates.extend((max(left, x), y))
+            self.create_line(*coordinates, fill=colour, width=2, smooth=True)
 
-            aktuellt, enhet = self._punkter[-1][1][serienamn]
-            y_text = uppe + index * 16
-            self.create_line(hoger + 8, y_text, hoger + 26, y_text, fill=farg, width=3)
+            current, unit = self._points[-1][1][name]
+            text_y = top + index * 16
+            self.create_line(right + 8, text_y, right + 26, text_y,
+                             fill=colour, width=3)
             self.create_text(
-                hoger + 32, y_text, anchor="w",
-                text=f"{serienamn}  {aktuellt:.1f} {enhet}",
+                right + 32, text_y, anchor="w",
+                text=f"{name}  {current:.1f} {unit}",
                 fill=TEXT, font=("Segoe UI", 8),
             )
 
 
 # ---------------------------------------------------------------------------
-# Huvudfönstret
+# The main window
 # ---------------------------------------------------------------------------
 
 
-def _hitta_par(
-    matning: Matning, enhet: str
+def _find_pair(
+    measurement: Measurement, unit: str
 ) -> tuple[float | None, float | None]:
-    """Leta upp (BÖR, ÄR) för en enhet, t.ex. mbar eller mg/slag.
+    """Find (SPEC, ACTUAL) for a unit, for example mbar or mg/stroke.
 
-    VAG-blocken lägger BÖR på position 2 och ÄR på position 3. Finns bara ett
-    värde med enheten tolkas det som ÄR.
+    VAG blocks put SPEC at position 2 and ACTUAL at position 3. When only one
+    value carries the unit it is treated as the actual value.
     """
-    for varden in matning.varden.values():
-        traffar = [(i, v) for i, v in enumerate(varden, start=1)
-                   if v.enhet == enhet and v.ar_tal]
-        if len(traffar) >= 2:
-            return traffar[0][1].tal, traffar[1][1].tal
-        if traffar:
-            return None, traffar[0][1].tal
+    for values in measurement.values.values():
+        hits = [(i, v) for i, v in enumerate(values, start=1)
+                if v.unit == unit and v.is_number]
+        if len(hits) >= 2:
+            return hits[0][1].number, hits[1][1].number
+        if hits:
+            return None, hits[0][1].number
     return None, None
 
 
-def _hitta_enkel(matning: Matning, enhet: str) -> float | None:
-    """Första numeriska värdet med angiven enhet."""
-    for varden in matning.varden.values():
-        for varde in varden:
-            if varde.enhet == enhet and varde.ar_tal:
-                return varde.tal
+def _find_single(measurement: Measurement, unit: str) -> float | None:
+    """First numeric value carrying the given unit."""
+    for values in measurement.values.values():
+        for value in values:
+            if value.unit == unit and value.is_number:
+                return value.number
     return None
 
 
-class Instrumentpanel(tk.Tk):
-    """Huvudfönstret: mätartavlor, realtidsgraf, loggning och felkoder."""
+class Dashboard(tk.Tk):
+    """The main window: gauges, real-time chart, logging and fault codes."""
 
-    def __init__(self, meny: Meny, adress: int = 0x01,
-                 grupper: Sequence[int] = (3, 11)) -> None:
+    def __init__(self, menu: Menu, address: int = 0x01,
+                 groups: Sequence[int] = (3, 11)) -> None:
         super().__init__()
-        self.meny = meny
-        self.adress = adress
-        self.title("VAGDIAG – instrumentpanel")
+        self.menu = menu
+        self.address = address
+        self.title("VAGDIAG - dashboard")
         self.geometry("1080x760")
-        self.configure(bg=BAKGRUND)
-        self.protocol("WM_DELETE_WINDOW", self._avsluta)
+        self.configure(bg=BACKGROUND)
+        self.protocol("WM_DELETE_WINDOW", self._quit)
 
-        self._ko: queue.Queue[object] = queue.Queue()
-        self._trad: Diagnostrad | None = None
-        self._start = time.monotonic()
-        self._loggar = False
-        self._senaste: Matning | None = None
+        self._queue: queue.Queue[object] = queue.Queue()
+        self._thread: DiagnosticThread | None = None
+        self._logging = False
+        self._latest: Measurement | None = None
 
-        self._bygg_gransnitt(grupper)
-        self._starta_trad(grupper)
-        self.after(50, self._tom_ko)
+        self._build_ui(groups)
+        self._start_thread(groups)
+        self.after(50, self._drain_queue)
 
-    # -- gränssnitt --------------------------------------------------------
+    # -- user interface ----------------------------------------------------
 
-    def _bygg_gransnitt(self, grupper: Sequence[int]) -> None:
-        stil = ttk.Style(self)
+    def _build_ui(self, groups: Sequence[int]) -> None:
+        style = ttk.Style(self)
         try:
-            stil.theme_use("clam")
-        except tk.TclError:  # pragma: no cover - beror på plattform
+            style.theme_use("clam")
+        except tk.TclError:  # pragma: no cover - platform dependent
             pass
-        stil.configure("TNotebook", background=BAKGRUND, borderwidth=0)
-        stil.configure("TNotebook.Tab", background=PANEL, foreground=TEXT, padding=(14, 6))
-        stil.map("TNotebook.Tab", background=[("selected", "#2a3142")])
-        stil.configure("TFrame", background=BAKGRUND)
+        style.configure("TNotebook", background=BACKGROUND, borderwidth=0)
+        style.configure("TNotebook.Tab", background=PANEL, foreground=TEXT,
+                        padding=(14, 6))
+        style.map("TNotebook.Tab", background=[("selected", "#2a3142")])
+        style.configure("TFrame", background=BACKGROUND)
 
-        flikar = ttk.Notebook(self)
-        flikar.pack(fill="both", expand=True, padx=8, pady=(8, 0))
+        tabs = ttk.Notebook(self)
+        tabs.pack(fill="both", expand=True, padx=8, pady=(8, 0))
 
-        matflik = ttk.Frame(flikar)
-        felflik = ttk.Frame(flikar)
-        flikar.add(matflik, text="  Mätvärden  ")
-        flikar.add(felflik, text="  Felkoder  ")
+        measuring_tab = ttk.Frame(tabs)
+        faults_tab = ttk.Frame(tabs)
+        tabs.add(measuring_tab, text="  Measurements  ")
+        tabs.add(faults_tab, text="  Fault codes  ")
 
-        self._bygg_matflik(matflik, grupper)
-        self._bygg_felflik(felflik)
+        self._build_measuring_tab(measuring_tab, groups)
+        self._build_faults_tab(faults_tab)
 
-        self.statusrad = tk.Label(
-            self, text="Startar ...", bg=BAKGRUND, fg=DAMPAD,
+        self.status_bar = tk.Label(
+            self, text="Starting ...", bg=BACKGROUND, fg=MUTED,
             anchor="w", font=("Segoe UI", 9),
         )
-        self.statusrad.pack(fill="x", padx=12, pady=6)
+        self.status_bar.pack(fill="x", padx=12, pady=6)
 
-    def _bygg_matflik(self, ram: ttk.Frame, grupper: Sequence[int]) -> None:
-        matarrad = tk.Frame(ram, bg=BAKGRUND)
-        matarrad.pack(fill="x", pady=(10, 4))
+    def _build_measuring_tab(self, frame: ttk.Frame, groups: Sequence[int]) -> None:
+        gauge_row = tk.Frame(frame, bg=BACKGROUND)
+        gauge_row.pack(fill="x", pady=(10, 4))
 
-        self.matare_varv = Matare(matarrad, "VARVTAL", 0, 5000, "1/min")
-        self.matare_ladd = Matare(matarrad, "LADDTRYCK", 800, 2400, "mbar")
-        self.matare_maf = Matare(matarrad, "LUFTMASSA", 0, 1000, "mg/slag")
-        for matare in (self.matare_varv, self.matare_ladd, self.matare_maf):
-            matare.pack(side="left", padx=10)
+        self.gauge_rpm = Gauge(gauge_row, "ENGINE SPEED", 0, 5000, "rpm")
+        self.gauge_boost = Gauge(gauge_row, "CHARGE PRESSURE", 800, 2400, "mbar")
+        self.gauge_maf = Gauge(gauge_row, "AIR MASS", 0, 1000, "mg/stroke")
+        for gauge in (self.gauge_rpm, self.gauge_boost, self.gauge_maf):
+            gauge.pack(side="left", padx=10)
 
-        varden = tk.Frame(matarrad, bg=PANEL)
-        varden.pack(side="left", fill="both", expand=True, padx=10)
-        self.varderuta = tk.Text(
-            varden, bg=PANEL, fg=TEXT, bd=0, height=11,
+        values_frame = tk.Frame(gauge_row, bg=PANEL)
+        values_frame.pack(side="left", fill="both", expand=True, padx=10)
+        self.values_box = tk.Text(
+            values_frame, bg=PANEL, fg=TEXT, bd=0, height=11,
             font=("Consolas", 9), state="disabled", wrap="none",
         )
-        self.varderuta.pack(fill="both", expand=True, padx=8, pady=8)
+        self.values_box.pack(fill="both", expand=True, padx=8, pady=8)
 
-        self.graf = Rullgraf(ram)
-        self.graf.pack(fill="both", expand=True, padx=12, pady=8)
+        self.chart = ScrollingChart(frame)
+        self.chart.pack(fill="both", expand=True, padx=12, pady=8)
 
-        kontroller = tk.Frame(ram, bg=BAKGRUND)
-        kontroller.pack(fill="x", padx=12, pady=(0, 10))
+        controls = tk.Frame(frame, bg=BACKGROUND)
+        controls.pack(fill="x", padx=12, pady=(0, 10))
 
-        tk.Label(kontroller, text="Grupper:", bg=BAKGRUND, fg=TEXT).pack(side="left")
-        self.gruppfalt = tk.Entry(kontroller, width=18, bg=PANEL, fg=TEXT,
-                                  insertbackground=TEXT, relief="flat")
-        self.gruppfalt.insert(0, " ".join(str(g) for g in grupper))
-        self.gruppfalt.pack(side="left", padx=(6, 4))
-        tk.Button(kontroller, text="Använd", command=self._byt_grupper,
+        tk.Label(controls, text="Groups:", bg=BACKGROUND, fg=TEXT).pack(side="left")
+        self.group_entry = tk.Entry(controls, width=18, bg=PANEL, fg=TEXT,
+                                    insertbackground=TEXT, relief="flat")
+        self.group_entry.insert(0, " ".join(str(g) for g in groups))
+        self.group_entry.pack(side="left", padx=(6, 4))
+        tk.Button(controls, text="Apply", command=self._change_groups,
                   bg=PANEL, fg=TEXT, relief="flat", padx=10).pack(side="left")
 
-        self.loggknapp = tk.Button(
-            kontroller, text="● Starta loggning", command=self._vaxla_logg,
-            bg=PANEL, fg=OK_FARG, relief="flat", padx=14,
+        self.log_button = tk.Button(
+            controls, text="● Start logging", command=self._toggle_log,
+            bg=PANEL, fg=OK_COLOUR, relief="flat", padx=14,
         )
-        self.loggknapp.pack(side="right")
-        self.pausknapp = tk.Button(
-            kontroller, text="Pausa", command=self._vaxla_paus,
+        self.log_button.pack(side="right")
+        self.pause_button = tk.Button(
+            controls, text="Pause", command=self._toggle_pause,
             bg=PANEL, fg=TEXT, relief="flat", padx=14,
         )
-        self.pausknapp.pack(side="right", padx=8)
+        self.pause_button.pack(side="right", padx=8)
 
-    def _bygg_felflik(self, ram: ttk.Frame) -> None:
-        knappar = tk.Frame(ram, bg=BAKGRUND)
-        knappar.pack(fill="x", padx=12, pady=10)
-        tk.Button(knappar, text="Läs felkoder", command=self._las_felkoder,
+    def _build_faults_tab(self, frame: ttk.Frame) -> None:
+        buttons = tk.Frame(frame, bg=BACKGROUND)
+        buttons.pack(fill="x", padx=12, pady=10)
+        tk.Button(buttons, text="Read fault codes", command=self._read_faults,
                   bg=PANEL, fg=TEXT, relief="flat", padx=14).pack(side="left")
-        tk.Button(knappar, text="Radera felkoder", command=self._radera_felkoder,
-                  bg=PANEL, fg=LARM, relief="flat", padx=14).pack(side="left", padx=8)
+        tk.Button(buttons, text="Clear fault codes", command=self._clear_faults,
+                  bg=PANEL, fg=ALERT, relief="flat", padx=14).pack(side="left", padx=8)
 
-        self.felruta = tk.Text(
-            ram, bg=PANEL, fg=TEXT, bd=0, font=("Consolas", 10),
+        self.faults_box = tk.Text(
+            frame, bg=PANEL, fg=TEXT, bd=0, font=("Consolas", 10),
             state="disabled", wrap="word",
         )
-        self.felruta.pack(fill="both", expand=True, padx=12, pady=(0, 12))
-        self._skriv_felruta("Tryck på \"Läs felkoder\".")
+        self.faults_box.pack(fill="both", expand=True, padx=12, pady=(0, 12))
+        self._write_faults_box("Press \"Read fault codes\".")
 
-    # -- trådstyrning ------------------------------------------------------
+    # -- thread plumbing ---------------------------------------------------
 
-    def _starta_trad(self, grupper: Sequence[int]) -> None:
-        self._trad = Diagnostrad(self.meny, self.adress, grupper, self._ko)
-        self._trad.start()
+    def _start_thread(self, groups: Sequence[int]) -> None:
+        self._thread = DiagnosticThread(self.menu, self.address, groups, self._queue)
+        self._thread.start()
 
-    def _tom_ko(self) -> None:
-        """Hämta meddelanden från serietråden. Körs i GUI-tråden via after()."""
+    def _drain_queue(self) -> None:
+        """Collect messages from the serial thread. Runs in the GUI thread."""
         try:
             while True:
-                self._hantera(self._ko.get_nowait())
+                self._handle(self._queue.get_nowait())
         except queue.Empty:
             pass
-        self.after(50, self._tom_ko)
+        self.after(50, self._drain_queue)
 
-    def _hantera(self, meddelande: object) -> None:
-        if isinstance(meddelande, Matning):
-            self._visa_matning(meddelande)
-        elif isinstance(meddelande, Status):
-            self._status(meddelande.text, meddelande.fel)
-        elif isinstance(meddelande, Identifikation):
-            self.title(f"VAGDIAG – {meddelande.namn} {meddelande.delnummer}")
-        elif isinstance(meddelande, VagdiagFel):
-            self._visa_fel(meddelande)
-        elif isinstance(meddelande, tuple) and meddelande[0] == "felkoder":
-            self._visa_felkoder(meddelande[1])
+    def _handle(self, message: object) -> None:
+        if isinstance(message, Measurement):
+            self._show_measurement(message)
+        elif isinstance(message, StatusMessage):
+            self._status(message.text, message.error)
+        elif isinstance(message, Identification):
+            self.title(f"VAGDIAG - {message.name} {message.part_number}")
+        elif isinstance(message, VagdiagError):
+            self._show_error(message)
+        elif isinstance(message, tuple) and message[0] == "faults":
+            self._show_faults(message[1])
 
-    def _status(self, text: str, fel: bool = False) -> None:
-        self.statusrad.configure(text=text, fg=LARM if fel else DAMPAD)
+    def _status(self, text: str, error: bool = False) -> None:
+        self.status_bar.configure(text=text, fg=ALERT if error else MUTED)
 
-    def _visa_fel(self, fel: VagdiagFel) -> None:
-        self._status(f"FEL: {fel.meddelande}", fel=True)
+    def _show_error(self, error: VagdiagError) -> None:
+        self._status(f"ERROR: {error.message}", error=True)
         messagebox.showerror(
-            "Kommunikationsfel",
-            f"{fel.meddelande}\n\n{fel.tips or ''}",
+            "Communication error",
+            f"{error.message}\n\n{error.hint or ''}",
             parent=self,
         )
 
     # -- presentation ------------------------------------------------------
 
-    def _visa_matning(self, matning: Matning) -> None:
-        self._senaste = matning
-        varv = _hitta_enkel(matning, "1/min")
-        ladd_bor, ladd_ar = _hitta_par(matning, "mbar")
-        maf_bor, maf_ar = _hitta_par(matning, "mg/slag")
+    def _show_measurement(self, measurement: Measurement) -> None:
+        self._latest = measurement
+        rpm = _find_single(measurement, "rpm")
+        boost_spec, boost_actual = _find_pair(measurement, "mbar")
+        maf_spec, maf_actual = _find_pair(measurement, "mg/stroke")
 
-        self.matare_varv.uppdatera(varv)
-        self.matare_ladd.uppdatera(ladd_ar, ladd_bor)
-        self.matare_maf.uppdatera(maf_ar, maf_bor)
+        self.gauge_rpm.update_values(rpm)
+        self.gauge_boost.update_values(boost_actual, boost_spec)
+        self.gauge_maf.update_values(maf_actual, maf_spec)
 
-        serier: dict[str, tuple[float, str]] = {}
-        for grupp, varden in matning.varden.items():
-            for position, varde in enumerate(varden, start=1):
-                if varde.ar_tal and varde.tal is not None:
-                    namn = f"{grupp:03d}.{position} {etikett(grupp, position, self.adress)}"
-                    serier[namn[:34]] = (varde.tal, varde.enhet)
-        self.graf.lagg_till(matning.tid, dict(list(serier.items())[:8]))
-        self.graf.rita()
-        self._skriv_varden(matning)
+        series: dict[str, tuple[float, str]] = {}
+        for group, values in measurement.values.items():
+            for position, value in enumerate(values, start=1):
+                if value.is_number and value.number is not None:
+                    name = f"{group:03d}.{position} {label(group, position, self.address)}"
+                    series[name[:34]] = (value.number, value.unit)
+        self.chart.add(measurement.time, dict(list(series.items())[:8]))
+        self.chart.redraw()
+        self._write_values(measurement)
 
-    def _skriv_varden(self, matning: Matning) -> None:
-        rader: list[str] = []
-        for grupp, varden in matning.varden.items():
-            rader.append(f"Grupp {grupp:03d}  {gruppnamn(grupp, self.adress)}")
-            if not varden:
-                rader.append("   (gruppen finns inte i styrdonet)")
-            for position, varde in enumerate(varden, start=1):
-                namn = etikett(grupp, position, self.adress)[:26]
-                rader.append(f"   {position}  {namn:<26} {varde.text:>18}")
-            rader.append("")
-        self.varderuta.configure(state="normal")
-        self.varderuta.delete("1.0", "end")
-        self.varderuta.insert("1.0", "\n".join(rader))
-        self.varderuta.configure(state="disabled")
+    def _write_values(self, measurement: Measurement) -> None:
+        lines: list[str] = []
+        for group, values in measurement.values.items():
+            lines.append(f"Group {group:03d}  {group_name(group, self.address)}")
+            if not values:
+                lines.append("   (this module has no such group)")
+            for position, value in enumerate(values, start=1):
+                name = label(group, position, self.address)[:26]
+                lines.append(f"   {position}  {name:<26} {value.text:>18}")
+            lines.append("")
+        self.values_box.configure(state="normal")
+        self.values_box.delete("1.0", "end")
+        self.values_box.insert("1.0", "\n".join(lines))
+        self.values_box.configure(state="disabled")
 
-    def _skriv_felruta(self, text: str) -> None:
-        self.felruta.configure(state="normal")
-        self.felruta.delete("1.0", "end")
-        self.felruta.insert("1.0", text)
-        self.felruta.configure(state="disabled")
+    def _write_faults_box(self, text: str) -> None:
+        self.faults_box.configure(state="normal")
+        self.faults_box.delete("1.0", "end")
+        self.faults_box.insert("1.0", text)
+        self.faults_box.configure(state="disabled")
 
-    def _visa_felkoder(self, koder: Sequence[Felkod]) -> None:
-        self._status(f"{len(koder)} felkod(er) lästa.")
-        if not koder:
-            self._skriv_felruta("Inga felkoder lagrade.")
+    def _show_faults(self, codes: Sequence[FaultCode]) -> None:
+        self._status(f"{len(codes)} fault code(s) read.")
+        if not codes:
+            self._write_faults_box("No fault codes stored.")
             return
-        rader = [f"{len(koder)} felkod(er):", ""]
-        for kod in koder:
-            markor = "[SP]" if kod.sporadisk else "    "
-            rader.append(f"{kod.nummer} {markor} {kod.text}")
-            rader.append(f"            {kod.statustext}")
-            rader.append("")
-        self._skriv_felruta("\n".join(rader))
+        lines = [f"{len(codes)} fault code(s):", ""]
+        for code in codes:
+            marker = "[INT]" if code.intermittent else "     "
+            lines.append(f"{code.number} {marker} {code.text}")
+            lines.append(f"             {code.status_text}")
+            lines.append("")
+        self._write_faults_box("\n".join(lines))
 
-    # -- knappar -----------------------------------------------------------
+    # -- buttons -----------------------------------------------------------
 
-    def _byt_grupper(self) -> None:
-        grupper: list[int] = []
-        for bit in self.gruppfalt.get().replace(",", " ").split():
+    def _change_groups(self) -> None:
+        groups: list[int] = []
+        for chunk in self.group_entry.get().replace(",", " ").split():
             try:
-                nummer = int(bit)
+                number = int(chunk)
             except ValueError:
                 continue
-            if 1 <= nummer <= 255:
-                grupper.append(nummer)
-        if not grupper:
+            if 1 <= number <= 255:
+                groups.append(number)
+        if not groups:
             messagebox.showwarning(
-                "Grupper", "Ange minst en grupp mellan 1 och 255.", parent=self
+                "Groups", "Enter at least one group between 1 and 255.", parent=self
             )
             return
-        self.graf.rensa()
-        if self._trad:
-            self._trad.kommando("grupper", grupper)
-        self._status(f"Läser grupp {', '.join(f'{g:03d}' for g in grupper)}")
+        self.chart.clear()
+        if self._thread:
+            self._thread.command("groups", groups)
+        self._status(f"Reading group {', '.join(f'{g:03d}' for g in groups)}")
 
-    def _vaxla_paus(self) -> None:
-        if not self._trad:
+    def _toggle_pause(self) -> None:
+        if not self._thread:
             return
-        pausad = self.pausknapp.cget("text") == "Pausa"
-        self._trad.kommando("paus", pausad)
-        self.pausknapp.configure(text="Fortsätt" if pausad else "Pausa")
+        pausing = self.pause_button.cget("text") == "Pause"
+        self._thread.command("pause", pausing)
+        self.pause_button.configure(text="Resume" if pausing else "Pause")
 
-    def _vaxla_logg(self) -> None:
-        if not self._trad:
+    def _toggle_log(self) -> None:
+        if not self._thread:
             return
-        if self._loggar:
-            self._trad.kommando("logg_stopp")
-            self._loggar = False
-            self.loggknapp.configure(text="● Starta loggning", fg=OK_FARG)
+        if self._logging:
+            self._thread.command("log_stop")
+            self._logging = False
+            self.log_button.configure(text="● Start logging", fg=OK_COLOUR)
             return
-        filnamn = f"vagdiag_{datetime.now():%Y%m%d_%H%M%S}.csv"
-        self._trad.kommando("logg_start", filnamn)
-        self._loggar = True
-        self.loggknapp.configure(text="■ Stoppa loggning", fg=LARM)
+        filename = f"vagdiag_{datetime.now():%Y%m%d_%H%M%S}.csv"
+        self._thread.command("log_start", filename)
+        self._logging = True
+        self.log_button.configure(text="■ Stop logging", fg=ALERT)
 
-    def _las_felkoder(self) -> None:
-        if self._trad:
-            self._trad.kommando("las_felkoder")
-            self._status("Läser felkoder ...")
+    def _read_faults(self) -> None:
+        if self._thread:
+            self._thread.command("read_faults")
+            self._status("Reading fault codes ...")
 
-    def _radera_felkoder(self) -> None:
-        if not self._trad:
+    def _clear_faults(self) -> None:
+        if not self._thread:
             return
-        svar = simpledialog.askstring(
-            "Radera felkoder",
-            "Felkodsminnet raderas permanent och går inte att få tillbaka.\n"
-            "Läs och anteckna koderna först.\n\n"
-            "Skriv JA för att radera:",
+        answer = simpledialog.askstring(
+            "Clear fault codes",
+            "The fault memory is erased permanently and cannot be recovered.\n"
+            "Read and write down the codes first.\n\n"
+            "Type YES to clear:",
             parent=self,
         )
-        if svar != "JA":
-            self._status("Radering avbruten – inget ändrades.")
+        if answer != "YES":
+            self._status("Clearing cancelled - nothing changed.")
             return
-        self._trad.kommando("radera_felkoder")
+        self._thread.command("clear_faults")
 
-    # -- avslut ------------------------------------------------------------
+    # -- shutdown ----------------------------------------------------------
 
-    def _avsluta(self) -> None:
-        if self._trad:
-            self._trad.kommando("stopp")
-            self._trad.stoppa()
+    def _quit(self) -> None:
+        if self._thread:
+            self._thread.command("stop")
+            self._thread.stop()
         self.destroy()
 
 
-def kor_gui(meny: Meny, adress: int = 0x01,
-            grupper: Sequence[int] = (3, 11)) -> int:
-    """Starta instrumentpanelen. Returnerar exitkod."""
+def run_gui(menu: Menu, address: int = 0x01,
+            groups: Sequence[int] = (3, 11)) -> int:
+    """Start the dashboard. Returns an exit code."""
     try:
-        panel = Instrumentpanel(meny, adress, grupper)
-    except tk.TclError as fel:  # pragma: no cover - kräver grafisk miljö
-        print(f"Kunde inte öppna ett fönster: {fel}")
-        print("Kör terminalläget i stället: python -m vagdiag <port>")
+        dashboard = Dashboard(menu, address, groups)
+    except tk.TclError as error:  # pragma: no cover - needs a display
+        print(f"Could not open a window: {error}")
+        print("Use the terminal mode instead: python -m vagdiag <port>")
         return 2
-    panel.mainloop()
+    dashboard.mainloop()
     return 0

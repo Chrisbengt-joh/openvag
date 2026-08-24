@@ -1,28 +1,30 @@
-"""KWP1281 över K-line – ren protokollimplementation utan användargränssnitt.
+"""KWP1281 over the K-line - a clean protocol implementation, no user interface.
 
-Protokollet i korthet
+The protocol in brief
 ---------------------
 
-1. **5-baud-init**: styrdonsadressen skickas som break-pulser, 200 ms per bit.
-   Styrdonet svarar ``0x55``, nyckelbyte 1, nyckelbyte 2. Efter ~30 ms svarar
-   vi med komplementet av nyckelbyte 2.
-2. **Blockformat**: ``[längd][blockräknare][titel][data...][0x03]`` där
-   ``längd = 3 + antal databytes``.
-3. **Bytekvittens**: varje byte utom det avslutande ``0x03`` kvitteras av
-   mottagaren med sitt komplement. Vi lägger in en liten fördröjning före
-   vår kvittens så att långsamma styrdon hinner med.
-4. **Blockräknaren** delas av båda parter och ökar med 1 per block (0xFF→0x00).
-5. **Keep-alive**: går det mer än ~1 s utan trafik tappar styrdonet sessionen,
-   så ett ACK-block (0x09) måste skickas regelbundet.
+1. **5-baud init**: the module address is sent as break pulses, 200 ms per bit.
+   The module answers ``0x55``, key byte 1, key byte 2. After roughly 30 ms we
+   reply with the complement of key byte 2.
+2. **Block format**: ``[length][block counter][title][data...][0x03]`` where
+   ``length = 3 + number of data bytes``.
+3. **Byte acknowledgement**: every byte except the trailing ``0x03`` is
+   acknowledged by the receiver with its complement. We insert a small delay
+   before our acknowledgement so that slow modules can keep up.
+4. **The block counter** is shared by both parties and increments by one per
+   block (0xFF wraps to 0x00).
+5. **Keep-alive**: if more than about a second passes without traffic the module
+   drops the session, so an ACK block (0x09) has to be sent regularly.
 
-Val av keep-alive-lösning
--------------------------
-Keep-alive körs i en **bakgrundstråd** (:meth:`KWP1281.starta_keepalive`).
-Skälet är att terminal- och GUI-lägena båda har lägen där huvudtråden blockerar
-på tangentbordsinmatning (menyval, bekräftelseord) – då hade en pump i
-huvudloopen tappat sessionen. All blocktrafik skyddas av ett ``RLock`` så att
-tråden aldrig kan hamna mitt i ett annat kommando. Behöver man ett strikt
-enkeltrådat läge finns :meth:`KWP1281.keep_alive` att anropa manuellt.
+Choice of keep-alive strategy
+-----------------------------
+Keep-alive runs in a **background thread** (:meth:`KWP1281.start_keepalive`).
+The reason is that both the terminal and the GUI have states where the main
+thread blocks on keyboard input (menu choices, confirmation words) - a pump in
+the main loop would have dropped the session there. All block traffic is guarded
+by an ``RLock`` so the thread can never land in the middle of another command.
+If you need a strictly single-threaded mode, call :meth:`KWP1281.keep_alive`
+yourself.
 """
 
 from __future__ import annotations
@@ -33,701 +35,706 @@ from dataclasses import dataclass, field
 from enum import IntEnum
 from typing import Callable, Iterable, Sequence
 
-from .felkoder import Felkod, avkoda_block, stalldonsnamn
-from .formler import Matvarde, berakna
-from .styrdon import AUTOSCAN_ADRESSER, styrdonsnamn
-from .transport import Transport
-from .undantag import (
-    KWPAnslutningsFel,
-    KWPFel,
-    KWPNekat,
-    KWPProtokollFel,
+from .exceptions import (
+    KWPConnectionError,
+    KWPError,
+    KWPProtocolError,
+    KWPRejected,
     KWPTimeout,
-    VagdiagFel,
+    VagdiagError,
 )
+from .faults import FaultCode, actuator_name, decode_block
+from .formulas import Reading, compute
+from .modules import AUTOSCAN_ADDRESSES, module_name
+from .transport import Transport
 
 __all__ = [
-    "Blocktitel",
+    "BlockTitle",
     "Block",
-    "KWPKanal",
+    "KWPChannel",
     "KWP1281",
-    "Identifikation",
-    "Anpassning",
-    "Stalldon",
-    "Skanresultat",
-    "skanna",
+    "Identification",
+    "Adaptation",
+    "Actuator",
+    "ScanResult",
+    "scan",
     "ETX",
 ]
 
-#: Avslutande byte i varje block.
+#: Terminating byte of every block.
 ETX = 0x03
 
-#: Synkbyte som styrdonet skickar efter lyckad 5-baud-väckning.
-SYNK = 0x55
+#: Sync byte the module sends after a successful 5-baud wake-up.
+SYNC = 0x55
 
 
-class Blocktitel(IntEnum):
-    """Blocktitlar (kommandon och svar) i KWP1281."""
+class BlockTitle(IntEnum):
+    """Block titles (commands and responses) in KWP1281."""
 
-    # Kommandon vi skickar
-    STALLDONSTEST = 0x04
-    RADERA_FELKODER = 0x05
-    AVSLUTA = 0x06
-    LAS_FELKODER = 0x07
+    # Commands we send
+    ACTUATOR_TEST = 0x04
+    CLEAR_FAULTS = 0x05
+    END_SESSION = 0x06
+    READ_FAULTS = 0x07
     ACK = 0x09
-    OMKODNING = 0x10          # implementeras EJ i v1 – för riskabelt
-    LAS_ANPASSNING = 0x21
-    TESTA_ANPASSNING = 0x22
-    GRUNDINSTALLNING = 0x28
-    LAS_MATGRUPP = 0x29
-    SPARA_ANPASSNING = 0x2A
+    RECODE = 0x10             # deliberately NOT implemented in v1 - too risky
+    READ_ADAPTATION = 0x21
+    TEST_ADAPTATION = 0x22
+    BASIC_SETTING = 0x28
+    READ_GROUP = 0x29
+    SAVE_ADAPTATION = 0x2A
     LOGIN = 0x2B
 
-    # Svar från styrdonet
-    ANPASSNINGSSVAR = 0xE6
-    MATVARDEN = 0xE7
-    EJ_TILLGANGLIG = 0xF4
-    STALLDONSSVAR = 0xF5
+    # Responses from the module
+    ADAPTATION_RESPONSE = 0xE6
+    GROUP_READING = 0xE7
+    NOT_AVAILABLE = 0xF4
+    ACTUATOR_RESPONSE = 0xF5
     IDENT = 0xF6
-    KODNING = 0xF7
-    FELKODER = 0xFC
+    CODING = 0xF7
+    FAULT_CODES = 0xFC
 
 
-def _namn_pa_titel(titel: int) -> str:
-    """Läsbart namn på en blocktitel (för fel- och felsökningsmeddelanden)."""
+def _title_name(title: int) -> str:
+    """Readable name of a block title (for errors and debug output)."""
     try:
-        return Blocktitel(titel).name
+        return BlockTitle(title).name
     except ValueError:
-        return f"0x{titel:02X}"
+        return f"0x{title:02X}"
 
 
 @dataclass(frozen=True)
 class Block:
-    """Ett mottaget eller skickat KWP1281-block."""
+    """One received or transmitted KWP1281 block."""
 
-    titel: int
+    title: int
     data: bytes = b""
-    raknare: int = 0
+    counter: int = 0
 
     @property
-    def titelnamn(self) -> str:
-        """Blocktitelns namn i klartext."""
-        return _namn_pa_titel(self.titel)
+    def title_name(self) -> str:
+        """The block title in plain text."""
+        return _title_name(self.title)
 
-    def __str__(self) -> str:  # pragma: no cover - felsökningshjälp
+    def __str__(self) -> str:  # pragma: no cover - debugging aid
         hexdata = " ".join(f"{b:02X}" for b in self.data)
-        return f"<Block {self.titelnamn} rakn={self.raknare} data=[{hexdata}]>"
+        return f"<Block {self.title_name} ctr={self.counter} data=[{hexdata}]>"
 
 
 # ---------------------------------------------------------------------------
-# Gemensamt byte- och blocklager
+# Shared byte and block layer
 # ---------------------------------------------------------------------------
 
 
-class KWPKanal:
-    """Byte- och blocklager för KWP1281.
+class KWPChannel:
+    """Byte and block layer for KWP1281.
 
-    Används av både klienten (:class:`KWP1281`) och ECU-simulatorn, så att
-    testerna kör exakt samma kvittens- och ekologik som riktig hårdvara.
+    Used by both the client (:class:`KWP1281`) and the ECU simulator, so the
+    tests exercise exactly the same acknowledgement and echo logic that real
+    hardware meets.
     """
 
     def __init__(
         self,
         transport: Transport,
         timeout: float = 1.0,
-        ack_fordrojning: float = 0.0015,
-        kontrollera_eko: bool = True,
-        kontrollera_raknare: bool = True,
-        spar: Callable[[str], None] | None = None,
+        ack_delay: float = 0.0015,
+        check_echo: bool = True,
+        check_counter: bool = True,
+        trace: Callable[[str], None] | None = None,
     ) -> None:
         self.transport = transport
         self.timeout = timeout
-        self.ack_fordrojning = ack_fordrojning
-        self.kontrollera_eko = kontrollera_eko
-        self.kontrollera_raknare = kontrollera_raknare
-        self.raknare = 0
-        self.senaste_trafik = time.monotonic()
-        self._raknare_synkad = False
-        self._spar = spar
+        self.ack_delay = ack_delay
+        self.check_echo = check_echo
+        self.check_counter = check_counter
+        self.counter = 0
+        self.last_traffic = time.monotonic()
+        self._counter_synced = False
+        self._trace = trace
 
-    # -- bytenivå ----------------------------------------------------------
+    # -- byte level --------------------------------------------------------
 
-    def _skriv_byte(self, b: int) -> None:
-        """Skriv en byte och konsumera ekot från K-line."""
+    def _write_byte(self, b: int) -> None:
+        """Write one byte and consume the K-line echo."""
         b &= 0xFF
-        self.transport.skriv_byte(b)
-        self.senaste_trafik = time.monotonic()
-        if not self.transport.ekar:
+        self.transport.write_byte(b)
+        self.last_traffic = time.monotonic()
+        if not self.transport.echoes:
             return
-        eko = self.transport.las_byte(self.timeout)
-        if self.kontrollera_eko and eko != b:
-            raise KWPProtokollFel(
-                f"Ekofel: skickade 0x{b:02X} men fick tillbaka 0x{eko:02X}. "
-                "K-line-kabeln eller latensinställningen är troligen problemet."
+        echo = self.transport.read_byte(self.timeout)
+        if self.check_echo and echo != b:
+            raise KWPProtocolError(
+                f"Echo mismatch: sent 0x{b:02X} but got 0x{echo:02X} back. "
+                "The K-line cable or the latency setting is the likely cause."
             )
 
-    def _las_byte(self, timeout: float | None = None) -> int:
-        """Läs en byte från bussen."""
-        b = self.transport.las_byte(self.timeout if timeout is None else timeout)
-        self.senaste_trafik = time.monotonic()
+    def _read_byte(self, timeout: float | None = None) -> int:
+        """Read one byte from the bus."""
+        b = self.transport.read_byte(self.timeout if timeout is None else timeout)
+        self.last_traffic = time.monotonic()
         return b
 
-    def _kvittera(self, b: int) -> None:
-        """Svara med komplementet av mottagen byte."""
-        if self.ack_fordrojning:
-            time.sleep(self.ack_fordrojning)
-        self._skriv_byte((~b) & 0xFF)
+    def _acknowledge(self, b: int) -> None:
+        """Answer with the complement of the received byte."""
+        if self.ack_delay:
+            time.sleep(self.ack_delay)
+        self._write_byte((~b) & 0xFF)
 
-    def skriv_ra(self, b: int) -> None:
-        """Skriv en byte utanför blockstrukturen (används i init-sekvensen)."""
-        self._skriv_byte(b)
+    def write_raw(self, b: int) -> None:
+        """Write a byte outside the block structure (used during init)."""
+        self._write_byte(b)
 
-    def las_ra(self, timeout: float | None = None) -> int:
-        """Läs en byte utanför blockstrukturen (används i init-sekvensen)."""
-        return self._las_byte(timeout)
+    def read_raw(self, timeout: float | None = None) -> int:
+        """Read a byte outside the block structure (used during init)."""
+        return self._read_byte(timeout)
 
-    # -- blocknivå ---------------------------------------------------------
+    # -- block level -------------------------------------------------------
 
-    def nasta_raknare(self) -> int:
-        """Stega blockräknaren (wrap 0xFF -> 0x00) och returnera det nya värdet."""
-        self.raknare = (self.raknare + 1) & 0xFF
-        return self.raknare
+    def next_counter(self) -> int:
+        """Advance the block counter (0xFF wraps to 0x00) and return it."""
+        self.counter = (self.counter + 1) & 0xFF
+        return self.counter
 
-    def skicka_block(self, titel: int, data: bytes | Sequence[int] = b"") -> Block:
-        """Skicka ett block och invänta mottagarens kvittens på varje byte."""
-        nyttolast = bytes(data)
-        langd = 3 + len(nyttolast)
-        if langd > 0xFF:
-            raise KWPProtokollFel("Blocket är för långt för KWP1281 (max 252 databytes).")
-        raknare = self.nasta_raknare()
-        ram = bytes([langd, raknare, titel & 0xFF]) + nyttolast
-        for b in ram:
-            self._skriv_byte(b)
-            kvitto = self._las_byte()
-            if kvitto != (~b) & 0xFF:
-                raise KWPProtokollFel(
-                    f"Felaktig kvittens på byte 0x{b:02X}: väntade "
-                    f"0x{(~b) & 0xFF:02X}, fick 0x{kvitto:02X}."
+    def send_block(self, title: int, data: bytes | Sequence[int] = b"") -> Block:
+        """Send a block, waiting for the receiver's acknowledgement of each byte."""
+        payload = bytes(data)
+        length = 3 + len(payload)
+        if length > 0xFF:
+            raise KWPProtocolError("Block too long for KWP1281 (max 252 data bytes).")
+        counter = self.next_counter()
+        frame = bytes([length, counter, title & 0xFF]) + payload
+        for b in frame:
+            self._write_byte(b)
+            ack = self._read_byte()
+            if ack != (~b) & 0xFF:
+                raise KWPProtocolError(
+                    f"Bad acknowledgement for byte 0x{b:02X}: expected "
+                    f"0x{(~b) & 0xFF:02X}, got 0x{ack:02X}."
                 )
-        self._skriv_byte(ETX)
-        block = Block(titel & 0xFF, nyttolast, raknare)
-        if self._spar:
-            self._spar(f"-> {block}")
+        self._write_byte(ETX)
+        block = Block(title & 0xFF, payload, counter)
+        if self._trace:
+            self._trace(f"-> {block}")
         return block
 
-    def las_block(self, timeout: float | None = None) -> Block:
-        """Läs ett block och kvittera varje byte utom det avslutande 0x03."""
-        langd = self._las_byte(timeout)
-        if langd < 3:
-            raise KWPProtokollFel(
-                f"Ogiltig blocklängd {langd} – förväntade minst 3. "
-                "Sessionen är ur synk."
+    def read_block(self, timeout: float | None = None) -> Block:
+        """Read a block, acknowledging every byte except the trailing 0x03."""
+        length = self._read_byte(timeout)
+        if length < 3:
+            raise KWPProtocolError(
+                f"Invalid block length {length} - expected at least 3. "
+                "The session is out of sync."
             )
-        self._kvittera(langd)
+        self._acknowledge(length)
 
-        raknare = self._las_byte()
-        self._kvittera(raknare)
-        if self.kontrollera_raknare and self._raknare_synkad:
-            vantat = (self.raknare + 1) & 0xFF
-            if raknare != vantat:
-                raise KWPProtokollFel(
-                    f"Blockräknaren hoppade: väntade {vantat}, fick {raknare}. "
-                    "Sessionen är ur synk."
+        counter = self._read_byte()
+        self._acknowledge(counter)
+        if self.check_counter and self._counter_synced:
+            expected = (self.counter + 1) & 0xFF
+            if counter != expected:
+                raise KWPProtocolError(
+                    f"Block counter jumped: expected {expected}, got {counter}. "
+                    "The session is out of sync."
                 )
 
-        titel = self._las_byte()
-        self._kvittera(titel)
+        title = self._read_byte()
+        self._acknowledge(title)
 
         data = bytearray()
-        for _ in range(langd - 3):
-            b = self._las_byte()
-            self._kvittera(b)
+        for _ in range(length - 3):
+            b = self._read_byte()
+            self._acknowledge(b)
             data.append(b)
 
-        etx = self._las_byte()
+        etx = self._read_byte()
         if etx != ETX:
-            raise KWPProtokollFel(
-                f"Blocket avslutades med 0x{etx:02X} i stället för 0x03."
+            raise KWPProtocolError(
+                f"Block terminated with 0x{etx:02X} instead of 0x03."
             )
 
-        self.raknare = raknare
-        self._raknare_synkad = True
-        block = Block(titel, bytes(data), raknare)
-        if self._spar:
-            self._spar(f"<- {block}")
+        self.counter = counter
+        self._counter_synced = True
+        block = Block(title, bytes(data), counter)
+        if self._trace:
+            self._trace(f"<- {block}")
         return block
 
 
 # ---------------------------------------------------------------------------
-# Datatyper för klienten
+# Client data types
 # ---------------------------------------------------------------------------
 
 
 @dataclass
-class Identifikation:
-    """Identifikationsuppgifter som styrdonet skickar efter init."""
+class Identification:
+    """Identification data the module sends right after init."""
 
-    adress: int
+    address: int
     kb1: int = 0
     kb2: int = 0
-    delnummer: str = ""
-    komponent: str = ""
-    kodning: int | None = None
+    part_number: str = ""
+    component: str = ""
+    coding: int | None = None
     wsc: int | None = None
-    textrader: list[str] = field(default_factory=list)
-    ra_block: list[bytes] = field(default_factory=list)
+    text_lines: list[str] = field(default_factory=list)
+    raw_blocks: list[bytes] = field(default_factory=list)
 
     @property
-    def namn(self) -> str:
-        """Styrdonets svenska namn."""
-        return styrdonsnamn(self.adress)
+    def name(self) -> str:
+        """Name of the control module."""
+        return module_name(self.address)
 
-    def sammanfattning(self) -> str:
-        """En kompakt rad om styrdonet."""
-        delar = [f"0x{self.adress:02X} {self.namn}"]
-        if self.delnummer:
-            delar.append(self.delnummer)
-        if self.komponent:
-            delar.append(self.komponent)
-        if self.kodning is not None:
-            delar.append(f"kodning {self.kodning}")
+    def summary(self) -> str:
+        """A compact one-line description of the module."""
+        parts = [f"0x{self.address:02X} {self.name}"]
+        if self.part_number:
+            parts.append(self.part_number)
+        if self.component:
+            parts.append(self.component)
+        if self.coding is not None:
+            parts.append(f"coding {self.coding}")
         if self.wsc is not None:
-            delar.append(f"WSC {self.wsc}")
-        return " | ".join(delar)
+            parts.append(f"WSC {self.wsc}")
+        return " | ".join(parts)
 
 
 @dataclass(frozen=True)
-class Anpassning:
-    """Svar på anpassningskommando (0x21/0x22/0x2A)."""
+class Adaptation:
+    """Response to an adaptation command (0x21/0x22/0x2A)."""
 
-    kanal: int
-    varde: int
-    matvarden: list[Matvarde] = field(default_factory=list)
+    channel: int
+    value: int
+    readings: list[Reading] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
-class Stalldon:
-    """Ett ställdon i ställdonstestsekvensen."""
+class Actuator:
+    """One actuator in the actuator test sequence."""
 
-    kod: int
-    ra: bytes
+    code: int
+    raw: bytes
 
     @property
-    def namn(self) -> str:
-        """Ställdonets namn ur databasen."""
-        return stalldonsnamn(self.kod)
+    def name(self) -> str:
+        """The actuator's name from the database."""
+        return actuator_name(self.code)
 
 
 @dataclass
-class Skanresultat:
-    """Resultatet av att prova ett styrdon under auto-scan."""
+class ScanResult:
+    """Result of probing one control module during an auto-scan."""
 
-    adress: int
-    svarade: bool = False
-    ident: Identifikation | None = None
-    felkoder: list[Felkod] = field(default_factory=list)
-    fel: str = ""
+    address: int
+    responded: bool = False
+    ident: Identification | None = None
+    faults: list[FaultCode] = field(default_factory=list)
+    error: str = ""
 
     @property
-    def namn(self) -> str:
-        """Styrdonets svenska namn."""
-        return styrdonsnamn(self.adress)
+    def name(self) -> str:
+        """Name of the control module."""
+        return module_name(self.address)
 
 
 # ---------------------------------------------------------------------------
-# Klienten
+# The client
 # ---------------------------------------------------------------------------
 
 
-class KWP1281(KWPKanal):
-    """Diagnosklient för ett KWP1281-styrdon."""
+class KWP1281(KWPChannel):
+    """Diagnostic client for one KWP1281 control module."""
 
-    #: Max antal identifikationsblock vi accepterar innan vi ger upp.
-    MAX_IDENTBLOCK = 40
+    #: Maximum number of identification blocks accepted before giving up.
+    MAX_IDENT_BLOCKS = 40
 
     def __init__(
         self,
         transport: Transport,
         timeout: float = 1.0,
         init_timeout: float = 2.0,
-        ack_fordrojning: float = 0.0015,
-        keepalive_intervall: float = 0.8,
-        spar: Callable[[str], None] | None = None,
+        ack_delay: float = 0.0015,
+        keepalive_interval: float = 0.8,
+        trace: Callable[[str], None] | None = None,
     ) -> None:
-        super().__init__(transport, timeout=timeout, ack_fordrojning=ack_fordrojning,
-                         spar=spar)
+        super().__init__(transport, timeout=timeout, ack_delay=ack_delay, trace=trace)
         self.init_timeout = init_timeout
-        self.keepalive_intervall = keepalive_intervall
-        self.ansluten = False
-        self.adress: int | None = None
-        self.ident: Identifikation | None = None
-        self._las = threading.RLock()
-        self._ka_trad: threading.Thread | None = None
-        self._ka_stopp = threading.Event()
-        self._ka_fel: KWPFel | None = None
+        self.keepalive_interval = keepalive_interval
+        self.connected = False
+        self.address: int | None = None
+        self.ident: Identification | None = None
+        self._lock = threading.RLock()
+        self._ka_thread: threading.Thread | None = None
+        self._ka_stop = threading.Event()
+        self._ka_error: KWPError | None = None
 
-    # -- anslutning --------------------------------------------------------
+    # -- connection --------------------------------------------------------
 
-    def anslut(self, adress: int, forsok: int = 2) -> Identifikation:
-        """Väck styrdonet på ``adress`` och läs in identifikationsblocken."""
-        sista: KWPFel | None = None
-        for nr in range(max(1, forsok)):
+    def connect(self, address: int, attempts: int = 2) -> Identification:
+        """Wake the module at ``address`` and read its identification blocks."""
+        last: KWPError | None = None
+        for number in range(max(1, attempts)):
             try:
-                return self._anslut_en_gang(adress)
-            except KWPFel as fel:
-                sista = fel
-                self.ansluten = False
-                if nr + 1 < forsok:
+                return self._connect_once(address)
+            except KWPError as exc:
+                last = exc
+                self.connected = False
+                if number + 1 < attempts:
                     time.sleep(0.5)
-        assert sista is not None
-        raise sista
+        assert last is not None
+        raise last
 
-    def _anslut_en_gang(self, adress: int) -> Identifikation:
-        with self._las:
-            self.stoppa_keepalive()
-            self.ansluten = False
-            self.raknare = 0
-            self._raknare_synkad = False
-            self.transport.rensa_in()
-            self.transport.skicka_5baud_adress(adress)
+    def _connect_once(self, address: int) -> Identification:
+        with self._lock:
+            self.stop_keepalive()
+            self.connected = False
+            self.counter = 0
+            self._counter_synced = False
+            self.transport.flush_input()
+            self.transport.send_5baud_address(address)
 
             try:
-                synk = self._las_byte(self.init_timeout)
-            except KWPTimeout as fel:
-                raise KWPAnslutningsFel(
-                    f"Inget svar från styrdon 0x{adress:02X} "
-                    f"({styrdonsnamn(adress)}) efter 5-baud-väckning."
-                ) from fel
-            if synk != SYNK:
-                raise KWPAnslutningsFel(
-                    f"Förväntade synkbyte 0x55 från 0x{adress:02X}, fick 0x{synk:02X}."
+                sync = self._read_byte(self.init_timeout)
+            except KWPTimeout as exc:
+                raise KWPConnectionError(
+                    f"No answer from module 0x{address:02X} "
+                    f"({module_name(address)}) after the 5-baud wake-up."
+                ) from exc
+            if sync != SYNC:
+                raise KWPConnectionError(
+                    f"Expected sync byte 0x55 from 0x{address:02X}, got 0x{sync:02X}."
                 )
 
-            kb1 = self._las_byte(self.init_timeout)
-            kb2 = self._las_byte(self.init_timeout)
+            kb1 = self._read_byte(self.init_timeout)
+            kb2 = self._read_byte(self.init_timeout)
 
             time.sleep(0.03)
-            self._skriv_byte((~kb2) & 0xFF)
+            self._write_byte((~kb2) & 0xFF)
 
-            ident = Identifikation(adress=adress, kb1=kb1, kb2=kb2)
-            self._las_identblock(ident)
+            ident = Identification(address=address, kb1=kb1, kb2=kb2)
+            self._read_ident_blocks(ident)
 
-            self.adress = adress
+            self.address = address
             self.ident = ident
-            self.ansluten = True
-            self._ka_fel = None
+            self.connected = True
+            self._ka_error = None
             return ident
 
-    def _las_identblock(self, ident: Identifikation) -> None:
-        """Läs identifikationsblocken (0xF6) tills styrdonet skickar ACK."""
-        for _ in range(self.MAX_IDENTBLOCK):
-            block = self.las_block(self.init_timeout)
-            if block.titel == Blocktitel.ACK:
+    def _read_ident_blocks(self, ident: Identification) -> None:
+        """Read identification blocks (0xF6) until the module sends an ACK."""
+        for _ in range(self.MAX_IDENT_BLOCKS):
+            block = self.read_block(self.init_timeout)
+            if block.title == BlockTitle.ACK:
                 return
-            ident.ra_block.append(block.data)
-            if block.titel in (Blocktitel.IDENT, Blocktitel.KODNING):
-                self._tolka_identblock(ident, block.data)
-            self.skicka_block(Blocktitel.ACK)
-        raise KWPProtokollFel(
-            "Styrdonet slutade aldrig skicka identifikationsblock."
+            ident.raw_blocks.append(block.data)
+            if block.title in (BlockTitle.IDENT, BlockTitle.CODING):
+                self._parse_ident_block(ident, block.data)
+            self.send_block(BlockTitle.ACK)
+        raise KWPProtocolError(
+            "The control module never stopped sending identification blocks."
         )
 
     @staticmethod
-    def _tolka_identblock(ident: Identifikation, data: bytes) -> None:
-        """Tolka ett identifikationsblock som text eller kodningsblock."""
+    def _parse_ident_block(ident: Identification, data: bytes) -> None:
+        """Interpret an identification block as text or as a coding block."""
         if not data:
             return
-        skrivbart = all(32 <= b < 127 for b in data)
-        if skrivbart:
+        printable = all(32 <= b < 127 for b in data)
+        if printable:
             text = data.decode("latin-1").strip()
             if not text:
                 return
-            ident.textrader.append(text)
-            if not ident.delnummer and _ser_ut_som_delnummer(text):
-                ident.delnummer = text
-            elif not ident.komponent:
-                ident.komponent = text
+            ident.text_lines.append(text)
+            if not ident.part_number and _looks_like_part_number(text):
+                ident.part_number = text
+            elif not ident.component:
+                ident.component = text
             return
-        # Kodningsblock: 7-bitars packning av kodning + verkstadskod (WSC).
+        # Coding block: 7-bit packing of the coding plus the workshop code.
         if len(data) >= 5:
-            ident.kodning = ((data[0] & 0x7F) << 14) | ((data[1] & 0x7F) << 7) | (
+            ident.coding = ((data[0] & 0x7F) << 14) | ((data[1] & 0x7F) << 7) | (
                 data[2] & 0x7F
             )
             ident.wsc = ((data[3] & 0x7F) << 7) | (data[4] & 0x7F)
 
-    def koppla_ner(self) -> None:
-        """Avsluta sessionen snyggt (block 0x06). Fel ignoreras."""
-        self.stoppa_keepalive()
-        with self._las:
-            if self.ansluten:
+    def disconnect(self) -> None:
+        """End the session cleanly (block 0x06). Errors are ignored."""
+        self.stop_keepalive()
+        with self._lock:
+            if self.connected:
                 try:
-                    self.skicka_block(Blocktitel.AVSLUTA)
-                except VagdiagFel:
+                    self.send_block(BlockTitle.END_SESSION)
+                except VagdiagError:
                     pass
-            self.ansluten = False
-            self.adress = None
+            self.connected = False
+            self.address = None
 
     def __enter__(self) -> KWP1281:
         return self
 
     def __exit__(self, *_exc: object) -> None:
-        self.koppla_ner()
+        self.disconnect()
 
     # -- keep-alive --------------------------------------------------------
 
     def keep_alive(self) -> None:
-        """Skicka ett ACK-block för att hålla sessionen vid liv."""
-        self._kommando(Blocktitel.ACK, forvantat=(Blocktitel.ACK,))
+        """Send one ACK block to keep the session alive."""
+        self._command(BlockTitle.ACK, expected=(BlockTitle.ACK,))
 
-    def starta_keepalive(self, intervall: float | None = None) -> None:
-        """Starta bakgrundstråden som håller sessionen vid liv."""
-        if intervall is not None:
-            self.keepalive_intervall = intervall
-        if self._ka_trad and self._ka_trad.is_alive():
+    def start_keepalive(self, interval: float | None = None) -> None:
+        """Start the background thread that keeps the session alive."""
+        if interval is not None:
+            self.keepalive_interval = interval
+        if self._ka_thread and self._ka_thread.is_alive():
             return
-        self._ka_stopp.clear()
-        self._ka_trad = threading.Thread(
+        self._ka_stop.clear()
+        self._ka_thread = threading.Thread(
             target=self._keepalive_loop, name="kwp1281-keepalive", daemon=True
         )
-        self._ka_trad.start()
+        self._ka_thread.start()
 
-    def stoppa_keepalive(self) -> None:
-        """Stoppa keep-alive-tråden och vänta in den."""
-        trad = self._ka_trad
-        self._ka_stopp.set()
-        self._ka_trad = None
-        if trad and trad.is_alive() and trad is not threading.current_thread():
-            trad.join(timeout=2.0)
+    def stop_keepalive(self) -> None:
+        """Stop the keep-alive thread and join it."""
+        thread = self._ka_thread
+        self._ka_stop.set()
+        self._ka_thread = None
+        if thread and thread.is_alive() and thread is not threading.current_thread():
+            thread.join(timeout=2.0)
 
     def _keepalive_loop(self) -> None:
-        """Skickar ACK-block när bussen varit tyst för länge."""
-        while not self._ka_stopp.wait(0.05):
-            if not self.ansluten:
+        """Send ACK blocks whenever the bus has been quiet for too long."""
+        while not self._ka_stop.wait(0.05):
+            if not self.connected:
                 continue
-            if time.monotonic() - self.senaste_trafik < self.keepalive_intervall:
+            if time.monotonic() - self.last_traffic < self.keepalive_interval:
                 continue
             try:
-                with self._las:
-                    if not self.ansluten or self._ka_stopp.is_set():
+                with self._lock:
+                    if not self.connected or self._ka_stop.is_set():
                         continue
-                    if time.monotonic() - self.senaste_trafik < self.keepalive_intervall:
+                    if time.monotonic() - self.last_traffic < self.keepalive_interval:
                         continue
-                    self.skicka_block(Blocktitel.ACK)
-                    self.las_block()
-            except VagdiagFel as fel:
-                self.ansluten = False
-                self._ka_fel = fel if isinstance(fel, KWPFel) else KWPFel(str(fel))
+                    self.send_block(BlockTitle.ACK)
+                    self.read_block()
+            except VagdiagError as exc:
+                self.connected = False
+                self._ka_error = exc if isinstance(exc, KWPError) else KWPError(str(exc))
                 return
 
     @property
-    def bakgrundsfel(self) -> KWPFel | None:
-        """Fel som keep-alive-tråden råkat ut för, om något."""
-        return self._ka_fel
+    def background_error(self) -> KWPError | None:
+        """Error the keep-alive thread ran into, if any."""
+        return self._ka_error
 
-    # -- kommandon ---------------------------------------------------------
+    # -- commands ----------------------------------------------------------
 
-    def _krav_ansluten(self) -> None:
-        if not self.ansluten:
-            if self._ka_fel is not None:
-                raise self._ka_fel
-            raise KWPFel(
-                "Ingen aktiv session – anslut till styrdonet först.",
-                tips="Slå av tändningen i 5 sekunder, slå på den igen och anslut om.",
+    def _require_connected(self) -> None:
+        if not self.connected:
+            if self._ka_error is not None:
+                raise self._ka_error
+            raise KWPError(
+                "No active session - connect to the control module first.",
+                hint="Switch the ignition off for five seconds, back on, and "
+                "reconnect.",
             )
 
-    def _kommando(
+    def _command(
         self,
-        titel: int,
+        title: int,
         data: bytes | Sequence[int] = b"",
-        forvantat: Iterable[int] | None = None,
+        expected: Iterable[int] | None = None,
         timeout: float | None = None,
     ) -> Block:
-        """Skicka ett kommandoblock och läs svaret."""
-        with self._las:
-            self._krav_ansluten()
+        """Send a command block and read the response."""
+        with self._lock:
+            self._require_connected()
             try:
-                self.skicka_block(titel, data)
-                svar = self.las_block(timeout)
-            except KWPFel:
-                self.ansluten = False
+                self.send_block(title, data)
+                response = self.read_block(timeout)
+            except KWPError:
+                self.connected = False
                 raise
-            if forvantat is not None and svar.titel not in tuple(forvantat):
-                vantat = ", ".join(_namn_pa_titel(t) for t in forvantat)
-                raise KWPNekat(
-                    f"Styrdonet svarade {svar.titelnamn} på "
-                    f"{_namn_pa_titel(titel)} (väntade {vantat})."
+            if expected is not None and response.title not in tuple(expected):
+                wanted = ", ".join(_title_name(t) for t in expected)
+                raise KWPRejected(
+                    f"The module answered {response.title_name} to "
+                    f"{_title_name(title)} (expected {wanted})."
                 )
-            return svar
+            return response
 
-    # -- felkoder ----------------------------------------------------------
+    # -- fault codes -------------------------------------------------------
 
-    def las_felkoder(self) -> list[Felkod]:
-        """Läs alla felkoder. Flera 0xFC-block hanteras och kvitteras."""
-        with self._las:
-            self._krav_ansluten()
-            koder: list[Felkod] = []
+    def read_faults(self) -> list[FaultCode]:
+        """Read all fault codes. Multiple 0xFC blocks are handled and acked."""
+        with self._lock:
+            self._require_connected()
+            codes: list[FaultCode] = []
             try:
-                self.skicka_block(Blocktitel.LAS_FELKODER)
+                self.send_block(BlockTitle.READ_FAULTS)
                 for _ in range(64):
-                    block = self.las_block()
-                    if block.titel == Blocktitel.ACK:
+                    block = self.read_block()
+                    if block.title == BlockTitle.ACK:
                         break
-                    if block.titel != Blocktitel.FELKODER:
-                        raise KWPNekat(
-                            f"Oväntat svar {block.titelnamn} vid felkodsläsning."
+                    if block.title != BlockTitle.FAULT_CODES:
+                        raise KWPRejected(
+                            f"Unexpected response {block.title_name} while "
+                            "reading fault codes."
                         )
-                    koder.extend(avkoda_block(block.data))
-                    self.skicka_block(Blocktitel.ACK)
+                    codes.extend(decode_block(block.data))
+                    self.send_block(BlockTitle.ACK)
                 else:
-                    raise KWPProtokollFel("Styrdonet slutade aldrig skicka felkoder.")
-            except KWPFel:
-                self.ansluten = False
+                    raise KWPProtocolError(
+                        "The control module never stopped sending fault codes."
+                    )
+            except KWPError:
+                self.connected = False
                 raise
-            return koder
+            return codes
 
-    def radera_felkoder(self) -> None:
-        """Radera felkodsminnet (block 0x05)."""
-        self._kommando(Blocktitel.RADERA_FELKODER, forvantat=(Blocktitel.ACK,))
+    def clear_faults(self) -> None:
+        """Clear the fault memory (block 0x05)."""
+        self._command(BlockTitle.CLEAR_FAULTS, expected=(BlockTitle.ACK,))
 
-    # -- mätvärden ---------------------------------------------------------
+    # -- measuring values --------------------------------------------------
 
     @staticmethod
-    def _tolka_matvarden(data: bytes) -> list[Matvarde]:
-        """Dela upp en nyttolast i grupper om tre bytes och räkna om dem."""
-        varden: list[Matvarde] = []
+    def _parse_readings(data: bytes) -> list[Reading]:
+        """Split a payload into three-byte groups and convert them."""
+        readings: list[Reading] = []
         for i in range(0, len(data) - 2, 3):
-            varden.append(berakna(data[i], data[i + 1], data[i + 2]))
-        return varden
+            readings.append(compute(data[i], data[i + 1], data[i + 2]))
+        return readings
 
-    def las_matgrupp(self, grupp: int) -> list[Matvarde]:
-        """Läs ett mätvärdesblock (block 0x29). Tom lista om gruppen saknas."""
-        svar = self._kommando(
-            Blocktitel.LAS_MATGRUPP,
-            bytes([grupp & 0xFF]),
-            forvantat=(Blocktitel.MATVARDEN, Blocktitel.ACK, Blocktitel.EJ_TILLGANGLIG),
+    def read_group(self, group: int) -> list[Reading]:
+        """Read a measuring block (0x29). Empty list when the group is absent."""
+        response = self._command(
+            BlockTitle.READ_GROUP,
+            bytes([group & 0xFF]),
+            expected=(BlockTitle.GROUP_READING, BlockTitle.ACK,
+                      BlockTitle.NOT_AVAILABLE),
         )
-        if svar.titel != Blocktitel.MATVARDEN:
+        if response.title != BlockTitle.GROUP_READING:
             return []
-        return self._tolka_matvarden(svar.data)
+        return self._parse_readings(response.data)
 
-    def grundinstallning(self, grupp: int) -> list[Matvarde]:
-        """Starta/läs grundinställning för en grupp (block 0x28).
+    def basic_setting(self, group: int) -> list[Reading]:
+        """Start/read a basic setting for a group (block 0x28).
 
-        VARNING: grundinställning kan starta ställdon och ändra adaptioner.
+        WARNING: a basic setting can drive actuators and reset adaptations.
         """
-        svar = self._kommando(
-            Blocktitel.GRUNDINSTALLNING,
-            bytes([grupp & 0xFF]),
-            forvantat=(
-                Blocktitel.MATVARDEN,
-                Blocktitel.ANPASSNINGSSVAR,
-                Blocktitel.ACK,
-                Blocktitel.EJ_TILLGANGLIG,
+        response = self._command(
+            BlockTitle.BASIC_SETTING,
+            bytes([group & 0xFF]),
+            expected=(
+                BlockTitle.GROUP_READING,
+                BlockTitle.ADAPTATION_RESPONSE,
+                BlockTitle.ACK,
+                BlockTitle.NOT_AVAILABLE,
             ),
         )
-        if svar.titel == Blocktitel.MATVARDEN:
-            return self._tolka_matvarden(svar.data)
-        if svar.titel == Blocktitel.ANPASSNINGSSVAR and len(svar.data) > 3:
-            return self._tolka_matvarden(svar.data[3:])
+        if response.title == BlockTitle.GROUP_READING:
+            return self._parse_readings(response.data)
+        if response.title == BlockTitle.ADAPTATION_RESPONSE and len(response.data) > 3:
+            return self._parse_readings(response.data[3:])
         return []
 
-    # -- ställdonstest -----------------------------------------------------
+    # -- actuator test -----------------------------------------------------
 
-    def stalldonstest_nasta(self) -> Stalldon | None:
-        """Stega till nästa ställdon (block 0x04). None när sekvensen är slut."""
-        svar = self._kommando(
-            Blocktitel.STALLDONSTEST,
-            forvantat=(Blocktitel.STALLDONSSVAR, Blocktitel.ACK,
-                       Blocktitel.EJ_TILLGANGLIG),
+    def actuator_test_next(self) -> Actuator | None:
+        """Step to the next actuator (block 0x04). None when the sequence ends."""
+        response = self._command(
+            BlockTitle.ACTUATOR_TEST,
+            expected=(BlockTitle.ACTUATOR_RESPONSE, BlockTitle.ACK,
+                      BlockTitle.NOT_AVAILABLE),
             timeout=max(self.timeout, 2.0),
         )
-        if svar.titel != Blocktitel.STALLDONSSVAR or len(svar.data) < 2:
+        if response.title != BlockTitle.ACTUATOR_RESPONSE or len(response.data) < 2:
             return None
-        kod = (svar.data[0] << 8) | svar.data[1]
-        if kod == 0:
+        code = (response.data[0] << 8) | response.data[1]
+        if code == 0:
             return None
-        return Stalldon(kod=kod, ra=svar.data)
+        return Actuator(code=code, raw=response.data)
 
-    # -- anpassning --------------------------------------------------------
+    # -- adaptation --------------------------------------------------------
 
     @staticmethod
-    def _tolka_anpassning(svar: Block, kanal: int) -> Anpassning:
-        """Tolka ett 0xE6-svar till en :class:`Anpassning`."""
-        if len(svar.data) < 3:
-            raise KWPProtokollFel(
-                f"För kort anpassningssvar ({len(svar.data)} bytes)."
+    def _parse_adaptation(response: Block, channel: int) -> Adaptation:
+        """Interpret a 0xE6 response as an :class:`Adaptation`."""
+        if len(response.data) < 3:
+            raise KWPProtocolError(
+                f"Adaptation response too short ({len(response.data)} bytes)."
             )
-        return Anpassning(
-            kanal=svar.data[0] if svar.data[0] else kanal,
-            varde=(svar.data[1] << 8) | svar.data[2],
-            matvarden=KWP1281._tolka_matvarden(svar.data[3:]),
+        return Adaptation(
+            channel=response.data[0] if response.data[0] else channel,
+            value=(response.data[1] << 8) | response.data[2],
+            readings=KWP1281._parse_readings(response.data[3:]),
         )
 
-    def las_anpassning(self, kanal: int) -> Anpassning:
-        """Läs en anpassningskanal (block 0x21)."""
-        svar = self._kommando(
-            Blocktitel.LAS_ANPASSNING,
-            bytes([kanal & 0xFF]),
-            forvantat=(Blocktitel.ANPASSNINGSSVAR,),
+    def read_adaptation(self, channel: int) -> Adaptation:
+        """Read an adaptation channel (block 0x21)."""
+        response = self._command(
+            BlockTitle.READ_ADAPTATION,
+            bytes([channel & 0xFF]),
+            expected=(BlockTitle.ADAPTATION_RESPONSE,),
         )
-        return self._tolka_anpassning(svar, kanal)
+        return self._parse_adaptation(response, channel)
 
-    def testa_anpassning(self, kanal: int, varde: int) -> Anpassning:
-        """Testa ett anpassningsvärde utan att spara (block 0x22)."""
-        _krav_16bit(varde)
-        svar = self._kommando(
-            Blocktitel.TESTA_ANPASSNING,
-            bytes([kanal & 0xFF, (varde >> 8) & 0xFF, varde & 0xFF]),
-            forvantat=(Blocktitel.ANPASSNINGSSVAR,),
+    def test_adaptation(self, channel: int, value: int) -> Adaptation:
+        """Test an adaptation value without storing it (block 0x22)."""
+        _require_16bit(value)
+        response = self._command(
+            BlockTitle.TEST_ADAPTATION,
+            bytes([channel & 0xFF, (value >> 8) & 0xFF, value & 0xFF]),
+            expected=(BlockTitle.ADAPTATION_RESPONSE,),
         )
-        return self._tolka_anpassning(svar, kanal)
+        return self._parse_adaptation(response, channel)
 
-    def spara_anpassning(self, kanal: int, varde: int) -> Anpassning:
-        """Spara ett anpassningsvärde permanent (block 0x2A).
+    def save_adaptation(self, channel: int, value: int) -> Adaptation:
+        """Store an adaptation value permanently (block 0x2A).
 
-        VARNING: skriver till styrdonets EEPROM. På kluster (0x17) och
-        startspärr (0x25) kan felaktiga värden ge startspärr.
+        WARNING: this writes to the module's EEPROM. On the instrument cluster
+        (0x17) and the immobilizer (0x25) a wrong value can immobilise the car.
         """
-        _krav_16bit(varde)
-        svar = self._kommando(
-            Blocktitel.SPARA_ANPASSNING,
-            bytes([kanal & 0xFF, (varde >> 8) & 0xFF, varde & 0xFF]),
-            forvantat=(Blocktitel.ANPASSNINGSSVAR, Blocktitel.ACK),
+        _require_16bit(value)
+        response = self._command(
+            BlockTitle.SAVE_ADAPTATION,
+            bytes([channel & 0xFF, (value >> 8) & 0xFF, value & 0xFF]),
+            expected=(BlockTitle.ADAPTATION_RESPONSE, BlockTitle.ACK),
         )
-        if svar.titel == Blocktitel.ACK:
-            return Anpassning(kanal=kanal, varde=varde)
-        return self._tolka_anpassning(svar, kanal)
+        if response.title == BlockTitle.ACK:
+            return Adaptation(channel=channel, value=value)
+        return self._parse_adaptation(response, channel)
 
     # -- login -------------------------------------------------------------
 
-    def login(self, kod: int) -> bool:
-        """Logga in med femsiffrig kod (block 0x2B). True vid ACK."""
-        _krav_16bit(kod)
-        svar = self._kommando(
-            Blocktitel.LOGIN,
-            bytes([(kod >> 8) & 0xFF, kod & 0xFF, 0x00]),
-            forvantat=(Blocktitel.ACK, Blocktitel.EJ_TILLGANGLIG),
+    def login(self, code: int) -> bool:
+        """Log in with a five-digit code (block 0x2B). True on ACK."""
+        _require_16bit(code)
+        response = self._command(
+            BlockTitle.LOGIN,
+            bytes([(code >> 8) & 0xFF, code & 0xFF, 0x00]),
+            expected=(BlockTitle.ACK, BlockTitle.NOT_AVAILABLE),
         )
-        return svar.titel == Blocktitel.ACK
+        return response.title == BlockTitle.ACK
 
 
-def _krav_16bit(varde: int) -> None:
-    """Kontrollera att ett värde ryms i 0–65535."""
-    if not 0 <= varde <= 0xFFFF:
-        raise VagdiagFel(
-            f"Värdet {varde} ligger utanför tillåtet intervall 0–65535.",
-            tips="Ange ett femsiffrigt tal mellan 0 och 65535.",
+def _require_16bit(value: int) -> None:
+    """Check that a value fits in 0-65535."""
+    if not 0 <= value <= 0xFFFF:
+        raise VagdiagError(
+            f"The value {value} is outside the allowed range 0-65535.",
+            hint="Enter a five-digit number between 0 and 65535.",
         )
 
 
-def _ser_ut_som_delnummer(text: str) -> bool:
-    """Grov heuristik för VAG-delnummer, t.ex. ``028906021AB``."""
-    kompakt = text.replace(" ", "")
+def _looks_like_part_number(text: str) -> bool:
+    """Rough heuristic for VAG part numbers, for example ``028906021AB``."""
+    compact = text.replace(" ", "")
     return (
-        8 <= len(kompakt) <= 14
-        and kompakt[0].isdigit()
-        and sum(c.isdigit() for c in kompakt) >= 6
-        and kompakt.isalnum()
+        8 <= len(compact) <= 14
+        and compact[0].isdigit()
+        and sum(c.isdigit() for c in compact) >= 6
+        and compact.isalnum()
     )
 
 
@@ -736,48 +743,48 @@ def _ser_ut_som_delnummer(text: str) -> bool:
 # ---------------------------------------------------------------------------
 
 
-def skanna(
+def scan(
     transport: Transport,
-    adresser: Iterable[int] = AUTOSCAN_ADRESSER,
-    forsok: int = 2,
+    addresses: Iterable[int] = AUTOSCAN_ADDRESSES,
+    attempts: int = 2,
     timeout: float = 0.6,
     init_timeout: float = 1.2,
-    paus: float = 0.6,
-    aterkoppling: Callable[[Skanresultat], None] | None = None,
-    spar: Callable[[str], None] | None = None,
-) -> list[Skanresultat]:
-    """Prova varje styrdonsadress: anslut, hämta ident, räkna felkoder, koppla ner.
+    pause: float = 0.6,
+    callback: Callable[[ScanResult], None] | None = None,
+    trace: Callable[[str], None] | None = None,
+) -> list[ScanResult]:
+    """Probe each module address: connect, fetch ident, count faults, disconnect.
 
-    Adresser som inte svarar rapporteras som tysta – det är helt normalt att de
-    flesta av dem saknas i en bil från 1999.
+    Addresses that do not answer are reported as silent - it is entirely normal
+    for most of them to be absent in a car from 1999.
     """
-    resultat: list[Skanresultat] = []
-    for adress in adresser:
-        post = Skanresultat(adress=adress)
-        klient = KWP1281(
+    results: list[ScanResult] = []
+    for address in addresses:
+        entry = ScanResult(address=address)
+        client = KWP1281(
             transport,
             timeout=timeout,
             init_timeout=init_timeout,
-            spar=spar,
+            trace=trace,
         )
         try:
-            post.ident = klient.anslut(adress, forsok=forsok)
-            post.svarade = True
+            entry.ident = client.connect(address, attempts=attempts)
+            entry.responded = True
             try:
-                post.felkoder = klient.las_felkoder()
-            except VagdiagFel as fel:
-                post.fel = f"Felkoder kunde inte läsas: {fel}"
-        except VagdiagFel as fel:
-            post.fel = str(fel)
+                entry.faults = client.read_faults()
+            except VagdiagError as exc:
+                entry.error = f"Fault codes could not be read: {exc}"
+        except VagdiagError as exc:
+            entry.error = str(exc)
         finally:
             try:
-                klient.koppla_ner()
-            except VagdiagFel:
+                client.disconnect()
+            except VagdiagError:
                 pass
-            transport.rensa_in()
-        resultat.append(post)
-        if aterkoppling:
-            aterkoppling(post)
-        if paus:
-            time.sleep(paus)
-    return resultat
+            transport.flush_input()
+        results.append(entry)
+        if callback:
+            callback(entry)
+        if pause:
+            time.sleep(pause)
+    return results

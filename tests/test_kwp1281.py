@@ -1,211 +1,208 @@
-"""Tester för protokollstacken – körs helt mot ECU-simulatorn, ingen hårdvara."""
+"""Protocol stack tests - run entirely against the ECU simulator, no hardware."""
 
 from __future__ import annotations
 
+import threading
 import time
 
 import pytest
 
-from vagdiag.felkoder import Felkod
-from vagdiag.kwp1281 import KWP1281, Blocktitel, KWPKanal, skanna
-from vagdiag.simulator import SIM_LOGIN, starta_simulator
-from vagdiag.transport import skapa_lankat_par
-from vagdiag.undantag import (
-    KWPAnslutningsFel,
-    KWPFel,
-    KWPProtokollFel,
+from vagdiag.exceptions import (
+    KWPConnectionError,
+    KWPError,
+    KWPProtocolError,
     KWPTimeout,
+    VagdiagError,
 )
+from vagdiag.faults import FaultCode
+from vagdiag.kwp1281 import KWP1281, BlockTitle, KWPChannel, scan
+from vagdiag.simulator import SIM_LOGIN, start_simulator
+from vagdiag.transport import create_linked_pair
 
 
 @pytest.fixture()
-def koppling():
-    """En startad simulator med kort sessionstimeout (snabb nedstängning)."""
-    sim = starta_simulator(sessionstimeout=1.0)
+def link():
+    """A running simulator with a short session timeout (fast teardown)."""
+    sim = start_simulator(session_timeout=1.0)
     try:
         yield sim
     finally:
-        sim.stang()
+        sim.close()
 
 
 @pytest.fixture()
-def klient(koppling):
-    """En ansluten klient mot simulatorn."""
-    k = KWP1281(koppling.transport, timeout=0.5, init_timeout=2.0, ack_fordrojning=0.0)
-    k.anslut(0x01)
+def client(link):
+    """A client connected to the simulator."""
+    c = KWP1281(link.transport, timeout=0.5, init_timeout=2.0, ack_delay=0.0)
+    c.connect(0x01)
     try:
-        yield k
+        yield c
     finally:
-        k.stoppa_keepalive()
+        c.stop_keepalive()
 
 
 # ---------------------------------------------------------------------------
-# Blockformatet i sig
+# The block format itself
 # ---------------------------------------------------------------------------
 
 
-def test_blockformat_fram_och_tillbaka():
-    """Ett block ska överleva resan med rätt titel, data och räknare."""
-    a_transport, b_transport = skapa_lankat_par()
-    a = KWPKanal(a_transport, timeout=1.0, ack_fordrojning=0.0)
-    b = KWPKanal(b_transport, timeout=1.0, ack_fordrojning=0.0)
+def test_block_round_trip():
+    """A block should survive the trip with its title, data and counter intact."""
+    a_transport, b_transport = create_linked_pair()
+    a = KWPChannel(a_transport, timeout=1.0, ack_delay=0.0)
+    b = KWPChannel(b_transport, timeout=1.0, ack_delay=0.0)
 
-    import threading
+    received = []
+    thread = threading.Thread(target=lambda: received.append(b.read_block()))
+    thread.start()
+    a.send_block(BlockTitle.READ_GROUP, bytes([3]))
+    thread.join(timeout=3.0)
 
-    mottaget = []
-    trad = threading.Thread(target=lambda: mottaget.append(b.las_block()))
-    trad.start()
-    a.skicka_block(Blocktitel.LAS_MATGRUPP, bytes([3]))
-    trad.join(timeout=3.0)
-
-    assert len(mottaget) == 1
-    block = mottaget[0]
-    assert block.titel == Blocktitel.LAS_MATGRUPP
+    assert len(received) == 1
+    block = received[0]
+    assert block.title == BlockTitle.READ_GROUP
     assert block.data == bytes([3])
-    assert block.raknare == 1
+    assert block.counter == 1
 
 
-def test_blockraknaren_wrappar():
-    """Blockräknaren ska gå 0xFF -> 0x00."""
-    transport, _ = skapa_lankat_par()
-    kanal = KWPKanal(transport)
-    kanal.raknare = 0xFE
-    assert kanal.nasta_raknare() == 0xFF
-    assert kanal.nasta_raknare() == 0x00
+def test_block_counter_wraps():
+    """The block counter must go 0xFF -> 0x00."""
+    transport, _ = create_linked_pair()
+    channel = KWPChannel(transport)
+    channel.counter = 0xFE
+    assert channel.next_counter() == 0xFF
+    assert channel.next_counter() == 0x00
 
 
 # ---------------------------------------------------------------------------
-# Anslutning och identifikation
+# Connecting and identification
 # ---------------------------------------------------------------------------
 
 
-def test_anslut_laser_ident(klient):
-    """Init ska ge nyckelbytes, delnummer, komponentnamn och kodning."""
-    ident = klient.ident
-    assert klient.ansluten
+def test_connect_reads_ident(client):
+    """Init should yield key bytes, part number, component name and coding."""
+    ident = client.ident
+    assert client.connected
     assert ident is not None
     assert ident.kb1 == 0x01 and ident.kb2 == 0x8A
-    assert ident.delnummer == "1Z9906019"
-    assert ident.komponent == "TDI SIMULATOR"
-    assert ident.kodning == 1
+    assert ident.part_number == "1Z9906019"
+    assert ident.component == "TDI SIMULATOR"
+    assert ident.coding == 1
     assert ident.wsc == 12345
-    assert "Motorstyrdon" in ident.sammanfattning()
+    assert "Engine" in ident.summary()
 
 
-def test_anslut_till_tyst_adress_ger_anslutningsfel(koppling):
-    """Adress utan styrdon ska ge ett begripligt fel, inte en hängning."""
-    k = KWP1281(koppling.transport, timeout=0.3, init_timeout=0.3)
-    with pytest.raises(KWPAnslutningsFel) as info:
-        k.anslut(0x02, forsok=1)
-    assert info.value.tips
+def test_connect_to_silent_address_raises(link):
+    """An address with no module should give a readable error, not a hang."""
+    c = KWP1281(link.transport, timeout=0.3, init_timeout=0.3)
+    with pytest.raises(KWPConnectionError) as info:
+        c.connect(0x02, attempts=1)
+    assert info.value.hint
 
 
-def test_koppla_ner_avslutar_sessionen(klient, koppling):
-    """Efter 0x06 ska simulatorn vara tillbaka och vänta på ny väckning."""
-    klient.koppla_ner()
-    assert not klient.ansluten
+def test_disconnect_ends_the_session(client, link):
+    """After 0x06 the simulator should be waiting for a new wake-up."""
+    client.disconnect()
+    assert not client.connected
     time.sleep(0.1)
-    klient.anslut(0x01)
-    assert koppling.ecu.sessioner == 2
+    client.connect(0x01)
+    assert link.ecu.sessions == 2
 
 
 # ---------------------------------------------------------------------------
-# Felkoder
+# Fault codes
 # ---------------------------------------------------------------------------
 
 
-def test_las_felkoder(klient):
-    """Båda simulerade felkoderna ska läsas och avkodas."""
-    koder = klient.las_felkoder()
-    assert [k.kod for k in koder] == [17965, 560]
-    assert isinstance(koder[0], Felkod)
-    assert koder[0].sporadisk is True
-    assert koder[1].sporadisk is False
-    assert "Laddtrycksreglering" in koder[0].text
-    assert "sporadisk" in koder[0].statustext
+def test_read_faults(client):
+    """Both simulated fault codes should be read and decoded."""
+    codes = client.read_faults()
+    assert [c.code for c in codes] == [17965, 560]
+    assert isinstance(codes[0], FaultCode)
+    assert codes[0].intermittent is True
+    assert codes[1].intermittent is False
+    assert "Charge pressure" in codes[0].text
+    assert "intermittent" in codes[0].status_text
 
 
-def test_radera_felkoder(klient, koppling):
-    """Efter radering ska minnet vara tomt."""
-    klient.radera_felkoder()
-    assert koppling.ecu.raderingar == 1
-    assert klient.las_felkoder() == []
-
-
-# ---------------------------------------------------------------------------
-# Mätvärden
-# ---------------------------------------------------------------------------
-
-
-def test_las_matgrupp_3(klient):
-    """Grupp 3 ska ge varvtal, luftmassa BÖR/ÄR och EGR-styrgrad."""
-    varden = klient.las_matgrupp(3)
-    assert len(varden) == 4
-    assert varden[0].enhet == "1/min"
-    assert 800 <= varden[0].tal <= 3500
-    assert varden[1].enhet == "mg/slag"
-    assert varden[2].enhet == "mg/slag"
-    assert varden[3].enhet == "%"
-
-
-def test_las_matgrupp_11_laddtryck(klient):
-    """Grupp 11 ska ge laddtryck i mbar."""
-    varden = klient.las_matgrupp(11)
-    assert varden[1].enhet == "mbar"
-    assert 900 <= varden[1].tal <= 2200
-
-
-def test_okand_matgrupp_ger_tom_lista(klient):
-    """En grupp som styrdonet saknar ska ge tom lista, inte undantag."""
-    assert klient.las_matgrupp(200) == []
-
-
-def test_grundinstallning(klient):
-    """Grundinställning ska ge mätvärden precis som en vanlig grupp."""
-    varden = klient.grundinstallning(3)
-    assert len(varden) == 4
+def test_clear_faults(client, link):
+    """After clearing, the memory should be empty."""
+    client.clear_faults()
+    assert link.ecu.clears == 1
+    assert client.read_faults() == []
 
 
 # ---------------------------------------------------------------------------
-# Ställdon, anpassning, login
+# Measuring values
 # ---------------------------------------------------------------------------
 
 
-def test_stalldonssekvens(klient):
-    """Ställdonstestet ska stega igenom sekvensen och sedan ta slut."""
-    namn = []
+def test_read_group_3(client):
+    """Group 3 should give engine speed, air mass SPEC/ACTUAL and EGR duty."""
+    values = client.read_group(3)
+    assert len(values) == 4
+    assert values[0].unit == "rpm"
+    assert 800 <= values[0].number <= 3500
+    assert values[1].unit == "mg/stroke"
+    assert values[2].unit == "mg/stroke"
+    assert values[3].unit == "%"
+
+
+def test_read_group_11_charge_pressure(client):
+    """Group 11 should give the charge pressure in mbar."""
+    values = client.read_group(11)
+    assert values[1].unit == "mbar"
+    assert 900 <= values[1].number <= 2200
+
+
+def test_unknown_group_returns_empty_list(client):
+    """A group the module lacks should return an empty list, not raise."""
+    assert client.read_group(200) == []
+
+
+def test_basic_setting(client):
+    """A basic setting should return readings just like a normal group."""
+    assert len(client.basic_setting(3)) == 4
+
+
+# ---------------------------------------------------------------------------
+# Actuators, adaptation, login
+# ---------------------------------------------------------------------------
+
+
+def test_actuator_sequence(client):
+    """The actuator test should step through the sequence and then finish."""
+    names = []
     for _ in range(10):
-        stalldon = klient.stalldonstest_nasta()
-        if stalldon is None:
+        actuator = client.actuator_test_next()
+        if actuator is None:
             break
-        namn.append(stalldon.namn)
-    assert len(namn) == 4
-    assert "N18" in namn[0]
-    assert klient.stalldonstest_nasta() is None
+        names.append(actuator.name)
+    assert len(names) == 4
+    assert "N18" in names[0]
+    assert client.actuator_test_next() is None
 
 
-def test_anpassning_las_testa_spara(klient, koppling):
-    """Läsning ger startvärdet, test ändrar inget, spara skriver."""
-    assert klient.las_anpassning(2).varde == 100
-    assert klient.testa_anpassning(2, 130).varde == 130
-    assert koppling.ecu.anpassning[2] == 100  # test sparar inte
-    assert klient.spara_anpassning(2, 130).varde == 130
-    assert koppling.ecu.anpassning[2] == 130
-    assert klient.las_anpassning(2).matvarden  # svaret bär även mätvärden
+def test_adaptation_read_test_save(client, link):
+    """Reading gives the stored value, testing changes nothing, saving writes."""
+    assert client.read_adaptation(2).value == 100
+    assert client.test_adaptation(2, 130).value == 130
+    assert link.ecu.adaptation[2] == 100  # testing does not store
+    assert client.save_adaptation(2, 130).value == 130
+    assert link.ecu.adaptation[2] == 130
+    assert client.read_adaptation(2).readings  # the response also carries readings
 
 
-def test_anpassning_utanfor_intervall(klient):
-    """Värden över 65535 ska stoppas innan de når bussen."""
-    from vagdiag.undantag import VagdiagFel
-
-    with pytest.raises(VagdiagFel):
-        klient.testa_anpassning(1, 70000)
+def test_adaptation_value_out_of_range(client):
+    """Values above 65535 must be stopped before they reach the bus."""
+    with pytest.raises(VagdiagError):
+        client.test_adaptation(1, 70000)
 
 
-def test_login(klient):
-    """Rätt kod ger True, fel kod ger False."""
-    assert klient.login(SIM_LOGIN) is True
-    assert klient.login(12345) is False
+def test_login(client):
+    """The right code gives True, a wrong one gives False."""
+    assert client.login(SIM_LOGIN) is True
+    assert client.login(12345) is False
 
 
 # ---------------------------------------------------------------------------
@@ -213,102 +210,102 @@ def test_login(klient):
 # ---------------------------------------------------------------------------
 
 
-def test_keepalive_haller_sessionen_vid_liv(koppling):
-    """Med keep-alive-tråden ska sessionen överleva en tyst period."""
-    koppling.ecu.sessionstimeout = 0.4
-    k = KWP1281(koppling.transport, timeout=0.5, ack_fordrojning=0.0)
-    k.anslut(0x01)
-    k.starta_keepalive(intervall=0.1)
+def test_keepalive_holds_the_session(link):
+    """With the keep-alive thread the session should survive a quiet period."""
+    link.ecu.session_timeout = 0.4
+    c = KWP1281(link.transport, timeout=0.5, ack_delay=0.0)
+    c.connect(0x01)
+    c.start_keepalive(interval=0.1)
     try:
         time.sleep(1.2)
-        assert k.bakgrundsfel is None
-        assert len(k.las_matgrupp(3)) == 4
+        assert c.background_error is None
+        assert len(c.read_group(3)) == 4
     finally:
-        k.stoppa_keepalive()
-        k.koppla_ner()
+        c.stop_keepalive()
+        c.disconnect()
 
 
-def test_utan_keepalive_dor_sessionen(koppling):
-    """Utan keep-alive ska styrdonet tappa sessionen – och felet vara begripligt."""
-    koppling.ecu.sessionstimeout = 0.3
-    k = KWP1281(koppling.transport, timeout=0.4, ack_fordrojning=0.0)
-    k.anslut(0x01)
+def test_without_keepalive_the_session_dies(link):
+    """Without keep-alive the module drops the session - with a readable error."""
+    link.ecu.session_timeout = 0.3
+    c = KWP1281(link.transport, timeout=0.4, ack_delay=0.0)
+    c.connect(0x01)
     time.sleep(0.9)
-    with pytest.raises(KWPFel) as info:
-        k.las_matgrupp(3)
-    assert info.value.tips
-    assert not k.ansluten
+    with pytest.raises(KWPError) as info:
+        c.read_group(3)
+    assert info.value.hint
+    assert not c.connected
 
 
 # ---------------------------------------------------------------------------
-# Felinjektion – klienten ska tappa sessionen snyggt, aldrig hänga
+# Fault injection - the client must fail gracefully, never hang
 # ---------------------------------------------------------------------------
 
 
-def test_tappad_kvittens_ger_timeout(klient, koppling):
-    """Uteblivet kvittensbyte ska ge KWPTimeout och död session."""
-    koppling.ecu.fel.tappa_nasta_kvittens = True
+def test_dropped_ack_gives_timeout(client, link):
+    """A missing acknowledgement byte should raise KWPTimeout and kill the session."""
+    link.ecu.faults.drop_next_ack = True
     with pytest.raises(KWPTimeout):
-        klient.las_matgrupp(3)
-    assert not klient.ansluten
+        client.read_group(3)
+    assert not client.connected
 
 
-def test_korrupt_kvittens_ger_protokollfel(klient, koppling):
-    """Fel komplement ska upptäckas direkt."""
-    koppling.ecu.fel.korrupt_nasta_kvittens = True
-    with pytest.raises(KWPProtokollFel) as info:
-        klient.las_matgrupp(3)
-    assert "kvittens" in str(info.value).lower()
+def test_corrupt_ack_gives_protocol_error(client, link):
+    """A wrong complement should be caught immediately."""
+    link.ecu.faults.corrupt_next_ack = True
+    with pytest.raises(KWPProtocolError) as info:
+        client.read_group(3)
+    assert "acknowledgement" in str(info.value).lower()
 
 
-def test_uteblivet_svar_ger_timeout(klient, koppling):
-    """Styrdon som tystnar efter ett kommando ska ge timeout."""
-    koppling.ecu.fel.tyst_pa_nasta_kommando = True
+def test_missing_response_gives_timeout(client, link):
+    """A module that goes silent after a command should time out."""
+    link.ecu.faults.silent_on_next_command = True
     with pytest.raises(KWPTimeout):
-        klient.las_matgrupp(3)
+        client.read_group(3)
 
 
-def test_korrupt_etx_ger_protokollfel(klient, koppling):
-    """Block som inte avslutas med 0x03 ska underkännas."""
-    koppling.ecu.fel.korrupt_etx_i_nasta_svar = True
-    with pytest.raises(KWPProtokollFel) as info:
-        klient.las_matgrupp(3)
+def test_corrupt_etx_gives_protocol_error(client, link):
+    """A block not terminated by 0x03 must be rejected."""
+    link.ecu.faults.corrupt_etx_in_next_response = True
+    with pytest.raises(KWPProtocolError) as info:
+        client.read_group(3)
     assert "0x03" in str(info.value)
 
 
-def test_fel_blockraknare_upptacks(klient, koppling):
-    """En blockräknare som hoppar betyder att sessionen är ur synk."""
-    koppling.ecu.fel.fel_raknare_i_nasta_svar = True
-    with pytest.raises(KWPProtokollFel) as info:
-        klient.las_matgrupp(3)
-    assert "räknare" in str(info.value).lower()
+def test_bad_block_counter_is_detected(client, link):
+    """A jumping block counter means the session is out of sync."""
+    link.ecu.faults.bad_counter_in_next_response = True
+    with pytest.raises(KWPProtocolError) as info:
+        client.read_group(3)
+    assert "counter" in str(info.value).lower()
 
 
-def test_ingen_respons_pa_init(koppling):
-    """Styrdon som inte vaknar ska ge anslutningsfel med tips."""
-    koppling.ecu.fel.svara_inte_pa_init = True
-    k = KWP1281(koppling.transport, timeout=0.3, init_timeout=0.3)
-    with pytest.raises(KWPAnslutningsFel):
-        k.anslut(0x01, forsok=1)
+def test_no_response_to_init(link):
+    """A module that never wakes should raise a connection error with a hint."""
+    link.ecu.faults.no_init_response = True
+    c = KWP1281(link.transport, timeout=0.3, init_timeout=0.3)
+    with pytest.raises(KWPConnectionError):
+        c.connect(0x01, attempts=1)
 
 
-def test_fel_synkbyte(koppling):
-    """Fel synkbyte i stället för 0x55 ska ge anslutningsfel."""
-    koppling.ecu.fel.fel_synkbyte = True
-    k = KWP1281(koppling.transport, timeout=0.3, init_timeout=0.5)
-    with pytest.raises(KWPAnslutningsFel) as info:
-        k.anslut(0x01, forsok=1)
+def test_bad_sync_byte(link):
+    """A wrong sync byte instead of 0x55 should raise a connection error."""
+    link.ecu.faults.bad_sync_byte = True
+    c = KWP1281(link.transport, timeout=0.3, init_timeout=0.5)
+    with pytest.raises(KWPConnectionError) as info:
+        c.connect(0x01, attempts=1)
     assert "0x55" in str(info.value)
 
 
-def test_klienten_aterhamtar_sig_efter_fel(klient, koppling):
-    """Efter ett protokollfel ska en ny anslutning fungera."""
-    koppling.ecu.fel.tappa_nasta_kvittens = True
+def test_client_recovers_after_a_fault(client, link):
+    """After a protocol error a fresh connection should work."""
+    link.ecu.faults.drop_next_ack = True
     with pytest.raises(KWPTimeout):
-        klient.las_matgrupp(3)
-    time.sleep(1.1)  # låt simulatorn ge upp sin trasiga session
-    klient.anslut(0x01)
-    assert len(klient.las_matgrupp(3)) == 4
+        client.read_group(3)
+    time.sleep(1.1)  # let the simulator give up on its broken session
+    client.connect(0x01)
+    assert len(client.read_group(3)) == 4
 
 
 # ---------------------------------------------------------------------------
@@ -316,20 +313,20 @@ def test_klienten_aterhamtar_sig_efter_fel(klient, koppling):
 # ---------------------------------------------------------------------------
 
 
-def test_skanna_hittar_bara_svarande_styrdon(koppling):
-    """Tysta adresser ska rapporteras som tysta utan att scanningen stannar."""
-    resultat = skanna(
-        koppling.transport,
-        adresser=(0x01, 0x02, 0x03),
-        forsok=1,
+def test_scan_only_finds_responding_modules(link):
+    """Silent addresses should be reported as silent without stopping the scan."""
+    results = scan(
+        link.transport,
+        addresses=(0x01, 0x02, 0x03),
+        attempts=1,
         timeout=0.3,
         init_timeout=0.3,
-        paus=0.0,
+        pause=0.0,
     )
-    assert [r.adress for r in resultat] == [0x01, 0x02, 0x03]
-    motor = resultat[0]
-    assert motor.svarade is True
-    assert motor.ident is not None
-    assert len(motor.felkoder) == 2
-    assert all(not r.svarade for r in resultat[1:])
-    assert all(r.fel for r in resultat[1:])
+    assert [r.address for r in results] == [0x01, 0x02, 0x03]
+    engine = results[0]
+    assert engine.responded is True
+    assert engine.ident is not None
+    assert len(engine.faults) == 2
+    assert all(not r.responded for r in results[1:])
+    assert all(r.error for r in results[1:])
