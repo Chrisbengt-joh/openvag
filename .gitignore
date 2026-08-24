@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+build/
+dist/
+.venv/
+venv/
+
+# Provkörningsloggar
+vagdiag_*.csv
+
+# Dubblettklon av GitHub-repot – ta bort mappen och den här raden när du vill
+/openvag/
