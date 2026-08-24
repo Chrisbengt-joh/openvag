@@ -29,7 +29,7 @@ from .transport import (
     set_ftdi_latency,
 )
 
-__all__ = ["main"]
+__all__ = ["main", "main_gui"]
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -191,6 +191,28 @@ def _run_direct(menu: Menu, args: argparse.Namespace) -> int:
     return 0
 
 
+def _run_gui(args: argparse.Namespace, trace) -> int:
+    """Start the desktop application, prefilled from the command line."""
+    from .gui import run_gui
+    from .guiworker import Settings
+
+    try:
+        address = int(args.module, 16)
+    except ValueError:
+        print(f"Invalid module address: {args.module}")
+        return 2
+    groups = [g for g in (args.groups or [3, 11]) if 1 <= g <= 255] or [3, 11]
+    settings = Settings(
+        timeout=args.timeout,
+        init_timeout=args.init_timeout,
+        interval=args.interval,
+        delimiter="," if args.csv_dot else ";",
+        decimal_comma=not args.csv_dot,
+        trace=trace,
+    )
+    return run_gui(settings, args.port, args.simulator, address, groups)
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     """Run VAGDIAG. Returns the process exit code."""
     setup_terminal()
@@ -206,6 +228,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.debug:
         def trace(text: str) -> None:
             print(text, file=sys.stderr)
+
+    if args.gui:
+        return _run_gui(args, trace)
 
     link = None
     try:
@@ -225,16 +250,6 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
 
     try:
-        if args.gui:
-            from .gui import run_gui
-
-            try:
-                gui_address = int(args.module, 16)
-            except ValueError:
-                print(f"Invalid module address: {args.module}")
-                return 2
-            gui_groups = [g for g in (args.groups or [3, 11]) if 1 <= g <= 255]
-            return run_gui(menu, gui_address, gui_groups or [3, 11])
         if args.autoscan or args.faults or args.groups:
             return _run_direct(menu, args)
         return menu.run()
@@ -250,6 +265,14 @@ def main(argv: Sequence[str] | None = None) -> int:
             link.close()  # type: ignore[attr-defined]
         else:
             transport.close()
+
+
+def main_gui(argv: Sequence[str] | None = None) -> int:
+    """Entry point for the desktop shortcut - always starts the window."""
+    arguments = list(argv if argv is not None else sys.argv[1:])
+    if "--gui" not in arguments:
+        arguments.append("--gui")
+    return main(arguments)
 
 
 if __name__ == "__main__":

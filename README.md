@@ -11,8 +11,19 @@ control module.
 > adaptation or basic setting can, in the worst case, leave you with a car that
 > will not start. Read the warnings the program shows you; do not skip them.
 
+VAGDIAG has a full desktop application, so you never have to touch a command
+line if you would rather not. It looks like this: pick your cable, pick a
+control module, and everything the tool can do is behind a tab.
+
+![The VAGDIAG connection screen: pick a KKL cable or the simulator, pick a
+control module, and connect.](docs/connect-screen.png)
+
+![The measurement tab: gauges where the target value is a second orange needle,
+a scrolling chart and one-button CSV logging.](docs/measurements.png)
+
 **Contents**
 
+- [The app - no terminal needed](#the-app---no-terminal-needed)
 - [What you need](#what-you-need)
 - [Installation](#installation)
 - [FTDI latency timer - 1 ms is mandatory](#ftdi-latency-timer---1-ms-is-mandatory)
@@ -20,7 +31,6 @@ control module.
 - [Quick start: diagnosing a smoking TDI](#quick-start-diagnosing-a-smoking-tdi)
 - [Command line](#command-line)
 - [The menu](#the-menu)
-- [The dashboard (GUI)](#the-dashboard-gui)
 - [The CSV logs](#the-csv-logs)
 - [Interpreting the readings](#interpreting-the-readings)
 - [Troubleshooting the program itself](#troubleshooting-the-program-itself)
@@ -69,8 +79,8 @@ From the project directory:
 pip install -e .
 ```
 
-That pulls in pyserial and adds a `vagdiag` command. If you would rather not
-install anything, this is enough:
+That pulls in pyserial and adds both a `vagdiag` command and a `vagdiag-gui`
+command. If you would rather not install anything, this is enough:
 
 ```
 pip install pyserial
@@ -300,25 +310,56 @@ you sit and think in a menu.
 
 ---
 
-## The dashboard (GUI)
+## The app - no terminal needed
 
-```
-python -m vagdiag COM3 --gui --groups 3 11
-```
+### Starting it
 
-- Round gauges for engine speed, charge pressure and air mass. **The SPEC value
-  sits in the same gauge as a second, orange needle**, so the deviation is
-  immediately visible.
-- A scrolling real-time chart of the last 60 seconds covering every numeric
-  value in the selected groups.
-- One-button CSV logging.
-- A separate fault-code tab with read and clear (clearing requires `YES`).
+**Windows:** double-click **`VAGDIAG.bat`** in the project folder. It checks
+that Python is present, installs the serial library if it is missing, and opens
+the window. Right-click it and choose *Send to -> Desktop (create shortcut)* if
+you want it on your desktop.
 
-All serial communication runs in its own thread that never touches tkinter; the
-GUI updates through a queue and `after()`. The window will not freeze even if
-the K-line drops out.
+**Linux:** run `./vagdiag-gui.sh`, or double-click it in your file manager.
 
----
+**If you installed with `pip install -e .`** you also get a `vagdiag-gui`
+command that opens the window directly, plus `python -m vagdiag --gui`.
+
+### The connection screen
+
+The first screen is everything you need to get connected:
+
+- **KKL cable** or **Simulator**. The simulator answers exactly like a real
+  engine module, so you can learn the whole program at the kitchen table before
+  going anywhere near the car.
+- **Port** - detected automatically, with a Refresh button. Underneath it the
+  app reports the FTDI latency timer: green when it is fine, red when it is too
+  slow, with a **Set latency timer to 1 ms** button that fixes it for you when
+  Windows lets it (and explains the manual route when it does not).
+- **Module** - a plain-language list: Engine, ABS brakes, Airbag, Instrument
+  cluster and so on. Engine is preselected.
+- **Scan every module** - probes every address and prints a report of what
+  answered and what fault codes each module holds. Silent addresses are normal.
+
+### The tabs
+
+| Tab | What it does |
+|-----|--------------|
+| **Measurements** | Round gauges for engine speed, charge pressure and air mass, with the **target value as a second orange needle in the same gauge** so deviation is obvious at a glance. A scrolling 60-second chart, a readout of every value, tick boxes to choose which measuring blocks to watch, Pause, and one-button logging that opens a normal Save dialog. |
+| **Fault codes** | Read and clear, with plain-language descriptions. Clearing asks you to type `YES`. |
+| **Actuator test** | A warning panel first (engine off, hands clear), then a big button that steps through the actuators one at a time, naming each one. |
+| **Adaptation** | Pick a channel, read it, and the old value stays on screen. You must test a value before the Save button will accept it, and saving asks you to type `SAVE`. Modules where a mistake can immobilise the car get an extra warning. There is a login box for channels that need one. |
+| **Basic setting** | Warning panel, pick a group, and a typed `YES` before anything starts. |
+| **Module info** | The module's identification plus a built-in crib sheet on what groups 003, 004, 011 and 013 mean on a 1.9 TDI. |
+
+Every destructive action asks you to type a word rather than just clicking OK,
+and values that use a reconstructed formula are marked with a `?`.
+
+### It cannot freeze
+
+All communication with the car runs on a background thread that never touches
+the user interface. If the cable falls out mid-measurement you get a readable
+dialog explaining what to check, and the app returns to the connection screen -
+not a frozen window.
 
 ## The CSV logs
 
@@ -503,9 +544,14 @@ vagdiag/
 ├── modules.py     - control module addresses and group labels
 ├── datalog.py     - CSV logger
 ├── menu.py        - terminal UI
-├── gui.py         - tkinter dashboard
+├── gui.py         - the desktop application (screens and workflow)
+├── guiwidgets.py  - gauges, chart and styling
+├── guiworker.py   - background threads; never touch tkinter
 ├── simulator.py   - virtual ECU
 └── __main__.py    - CLI
+
+VAGDIAG.bat        - double-click launcher for Windows
+vagdiag-gui.sh     - double-click launcher for Linux
 ```
 
 ### Tests
