@@ -46,6 +46,7 @@ from .exceptions import (
 from .faults import FaultCode, actuator_name, decode_block
 from .formulas import Reading, compute
 from .modules import AUTOSCAN_ADDRESSES, module_name
+from .transport import AUTO_BAUDS
 from .transport import Transport
 
 __all__ = [
@@ -63,6 +64,11 @@ __all__ = [
 
 #: Terminating byte of every block.
 ETX = 0x03
+
+
+def _hexlist(values: list[int]) -> str:
+    return " ".join(f"0x{v:02X}" for v in values)
+
 
 #: Sync byte the module sends after a successful 5-baud wake-up.
 SYNC = 0x55
@@ -168,6 +174,9 @@ class KWPChannel:
                 f"Echo mismatch: sent 0x{b:02X} but got 0x{echo:02X} back. "
                 "The K-line cable or the latency setting is the likely cause."
             )
+
+    #: Echo/garbage bytes tolerated while waiting for the sync byte.
+    MAX_INIT_JUNK = 8
 
     def _read_byte(self, timeout: float | None = None) -> int:
         """Read one byte from the bus."""
@@ -371,18 +380,62 @@ class KWP1281(KWPChannel):
     # -- connection --------------------------------------------------------
 
     def connect(self, address: int, attempts: int = 2) -> Identification:
-        """Wake the module at ``address`` and read its identification blocks."""
+        """Wake the module at ``address`` and read its identification blocks.
+
+        When the transport allows it (``auto_baud``), a module that answers
+        at the wrong baud rate makes us switch to the next rate in
+        :data:`AUTO_BAUDS` and try again. The transport keeps the rate that
+        worked, so later connects start there.
+        """
         last: KWPError | None = None
-        for number in range(max(1, attempts)):
+        bauds_tried: set[int] = set()
+        number = 0
+        while number < max(1, attempts):
+            number += 1
             try:
                 return self._connect_once(address)
+            except KWPConnectionError as exc:
+                last = exc
+                self.connected = False
+                if exc.wrong_baud and self._switch_baud(bauds_tried):
+                    number -= 1                 # does not use up an attempt
+                    continue
             except KWPError as exc:
                 last = exc
                 self.connected = False
-                if number + 1 < attempts:
-                    time.sleep(0.5)
+            if number < attempts:
+                time.sleep(0.5)
         assert last is not None
         raise last
+
+    def _switch_baud(self, tried: set[int]) -> bool:
+        """Move the transport to the next untried rate. False when done."""
+        transport = self.transport
+        if not transport.auto_baud or transport.baud is None:
+            return False
+        tried.add(transport.baud)
+        for baud in AUTO_BAUDS:
+            if baud not in tried:
+                break
+        else:
+            return False
+        # Let the module finish its retries and drop back to idle before we
+        # wake it again, otherwise the second init lands in the middle of it.
+        self._drain(1.5)
+        if not transport.set_baud(baud):
+            return False
+        if self._trace:
+            self._trace(f"switching to {baud} baud")
+        return True
+
+    def _drain(self, quiet: float) -> None:
+        """Read and discard until the line has been silent for ``quiet`` s."""
+        deadline = time.monotonic() + 10.0
+        while time.monotonic() < deadline:
+            try:
+                self.transport.read_byte(quiet)
+            except KWPError:
+                return
 
     def _connect_once(self, address: int) -> Identification:
         with self._lock:
@@ -393,17 +446,40 @@ class KWP1281(KWPChannel):
             self.transport.flush_input()
             self.transport.send_5baud_address(address)
 
-            try:
-                sync = self._read_byte(self.init_timeout)
-            except KWPTimeout as exc:
-                raise KWPConnectionError(
-                    f"No answer from module 0x{address:02X} "
-                    f"({module_name(address)}) after the 5-baud wake-up."
-                ) from exc
-            if sync != SYNC:
-                raise KWPConnectionError(
-                    f"Expected sync byte 0x55 from 0x{address:02X}, got 0x{sync:02X}."
-                )
+            # Wait for the sync byte. On a real K-line our own break shows
+            # up as echo garbage (0x00 and the like) before the module's 0x55,
+            # so skip a handful of junk bytes rather than flushing blindly.
+            junk: list[int] = []
+            deadline = time.monotonic() + self.init_timeout
+            while True:
+                remaining = deadline - time.monotonic()
+                try:
+                    if remaining <= 0:
+                        raise KWPTimeout("init timeout")
+                    sync = self._read_byte(remaining)
+                except KWPTimeout as exc:
+                    if junk:
+                        raise KWPConnectionError(
+                            f"Module 0x{address:02X} ({module_name(address)}) "
+                            f"sent {_hexlist(junk)} but never the sync byte 0x55. "
+                            "It may talk at 9600 baud instead of 10400 "
+                            "(--baud 9600), or the K-line is noisy.",
+                            wrong_baud=True,
+                        ) from exc
+                    raise KWPConnectionError(
+                        f"No answer from module 0x{address:02X} "
+                        f"({module_name(address)}) after the 5-baud wake-up."
+                    ) from exc
+                if sync == SYNC:
+                    break
+                junk.append(sync)
+                if len(junk) > self.MAX_INIT_JUNK:
+                    raise KWPConnectionError(
+                        f"Expected sync byte 0x55 from 0x{address:02X}, "
+                        f"got {_hexlist(junk)}. The module may talk at 9600 "
+                        "baud instead of 10400 (--baud 9600).",
+                        wrong_baud=True,
+                    )
 
             kb1 = self._read_byte(self.init_timeout)
             kb2 = self._read_byte(self.init_timeout)

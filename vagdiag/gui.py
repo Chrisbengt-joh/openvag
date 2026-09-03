@@ -1214,7 +1214,7 @@ class App(tk.Tk):
                 self.transport = self.simulator_link.transport
             else:
                 assert port is not None
-                self.transport = SerialTransport(port, timeout=self.settings.timeout)
+                self.transport = SerialTransport(port, baud=self.settings.baud, timeout=self.settings.timeout)
             return True
         except VagdiagError as error:
             self.show_error(error)

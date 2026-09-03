@@ -39,6 +39,7 @@ class Settings:
 
     timeout: float = 1.0
     init_timeout: float = 2.0
+    baud: int | None = None      # None = detect automatically
     interval: float = 0.0
     delimiter: str = ";"
     decimal_comma: bool = True

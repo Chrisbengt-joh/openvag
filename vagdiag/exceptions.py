@@ -64,6 +64,12 @@ class KWPProtocolError(KWPError):
 class KWPConnectionError(KWPError):
     """The 5-baud init failed - no control module answered."""
 
+    def __init__(self, message: str, hint: str | None = None,
+                 wrong_baud: bool = False) -> None:
+        super().__init__(message, hint)
+        #: True when the module answered, but at a different baud rate.
+        self.wrong_baud = wrong_baud
+
 
 class KWPRejected(KWPError):
     """The control module refused the command (answered with another title)."""

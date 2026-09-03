@@ -83,6 +83,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="per-byte timeout in seconds (default: 1.0)",
     )
     other.add_argument(
+        "--baud", type=int, default=None, metavar="N",
+        help="force the K-line baud rate (10400 or 9600). By default the "
+        "program tries 10400 and falls back to 9600 on its own",
+    )
+    other.add_argument(
         "--init-timeout", type=float, default=2.0, metavar="S",
         help="timeout for the answer to the 5-baud init (default: 2.0)",
     )
@@ -156,7 +161,7 @@ def _open_transport(args: argparse.Namespace) -> tuple[Transport, object | None]
             hint="Run 'python -m vagdiag --list-ports' to see your ports, or "
             "'python -m vagdiag --simulator' to try it without a car.",
         )
-    return SerialTransport(args.port, timeout=args.timeout), None
+    return SerialTransport(args.port, baud=args.baud, timeout=args.timeout), None
 
 
 def _run_direct(menu: Menu, args: argparse.Namespace) -> int:

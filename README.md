@@ -266,6 +266,7 @@ python -m vagdiag [PORT] [options]
 | `--interval 0.2` | Pause between polling cycles (default: as fast as possible). |
 | `--timeout 1.0` | Per-byte timeout. Raise it if the module is sluggish. |
 | `--init-timeout 2.0` | Timeout for the answer to the 5-baud wake-up. |
+| `--baud N` | Force the K-line baud rate. By default the program tries 10400 and falls back to 9600 by itself, which is what an EDC15 on a 1999 TDI needs. |
 | `--csv-dot` | CSV with commas and a decimal point instead of the European Excel style. |
 | `--debug` | Trace all block traffic to stderr. |
 

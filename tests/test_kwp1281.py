@@ -330,3 +330,90 @@ def test_scan_only_finds_responding_modules(link):
     assert len(engine.faults) == 2
     assert all(not r.responded for r in results[1:])
     assert all(r.error for r in results[1:])
+
+
+# -- 5-baud wake-up bit pattern ---------------------------------------------
+
+def test_five_baud_bits_uses_seven_data_bits_and_odd_parity():
+    from vagdiag.transport import five_baud_bits
+
+    # 0x01: one data bit set -> parity 0. Identical to a plain 8-bit byte.
+    assert five_baud_bits(0x01) == [0, 1, 0, 0, 0, 0, 0, 0, 0, 1]
+    # 0x17 (cluster): four ones -> parity 1, i.e. 0x97 on the wire.
+    assert five_baud_bits(0x17) == [0, 1, 1, 1, 0, 1, 0, 0, 1, 1]
+    # 0x03 (ABS): two ones -> parity 1.
+    assert five_baud_bits(0x03) == [0, 1, 1, 0, 0, 0, 0, 0, 1, 1]
+    for addr in range(0x80):
+        bits = five_baud_bits(addr)
+        assert len(bits) == 10 and bits[0] == 0 and bits[-1] == 1
+        assert sum(bits[1:9]) % 2 == 1
+
+
+def test_connect_skips_echo_junk_before_sync(link):
+    """The break echoes as 0x00 on our own receiver; connect must ignore it."""
+    junk_sent = []
+    orig = link.transport.send_5baud_address
+
+    def noisy(address):
+        orig(address)
+        for b in (0x00, 0x00, 0xFF):
+            link.transport._own.put(b)
+            junk_sent.append(b)
+
+    link.transport.send_5baud_address = noisy
+    kwp = KWP1281(link.transport, init_timeout=2.0)
+    ident = kwp.connect(0x01)
+    assert ident.address == 0x01
+    assert junk_sent
+    kwp.disconnect()
+
+
+def test_connect_falls_back_to_9600_baud(link):
+    """A module answering at 9600 shows up as garbage at 10400; the client
+    must switch rate and wake it again."""
+    transport = link.transport
+    orig = transport.send_5baud_address
+    transport.baud = 10400
+    transport.auto_baud = True
+    switched = []
+
+    def set_baud(baud):
+        transport.baud = baud
+        switched.append(baud)
+        return True
+
+    transport.set_baud = set_baud
+
+    def wake(address):
+        if transport.baud == 9600:
+            orig(address)
+        else:
+            # What a 9600-baud 0x55 0x01 0x8A looks like when read at 10400
+            # (captured from an EDC15), preceded by the break echo.
+            for b in (0x00, 0x00, 0x95, 0x01, 0x0A, 0xB5, 0x01, 0x0A):
+                transport._own.put(b)
+
+    transport.send_5baud_address = wake
+    kwp = KWP1281(transport, init_timeout=1.0)
+    ident = kwp.connect(0x01)
+    assert ident.address == 0x01
+    assert switched == [9600]
+    assert transport.baud == 9600
+    kwp.disconnect()
+
+
+def test_forced_baud_does_not_switch(link):
+    transport = link.transport
+    transport.baud = 10400
+    transport.auto_baud = False
+    transport.set_baud = lambda baud: (_ for _ in ()).throw(AssertionError("switched"))
+
+    def wake(address):
+        for b in (0x00, 0x95, 0x01, 0x0A):
+            transport._own.put(b)
+
+    transport.send_5baud_address = wake
+    kwp = KWP1281(transport, init_timeout=0.5)
+    with pytest.raises(KWPConnectionError) as info:
+        kwp.connect(0x01, attempts=1)
+    assert info.value.wrong_baud

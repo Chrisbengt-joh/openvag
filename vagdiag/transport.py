@@ -33,6 +33,8 @@ __all__ = [
     "MemoryTransport",
     "create_linked_pair",
     "list_ports",
+    "AUTO_BAUDS",
+    "five_baud_bits",
     "pyserial_available",
     "read_ftdi_latency",
     "set_ftdi_latency",
@@ -41,8 +43,20 @@ __all__ = [
 #: Standard baud rate for KWP1281 over the K-line.
 BAUD = 10400
 
+#: Baud rates tried in turn when the rate is not forced. Most modules use
+#: 10400; many older ones (EDC15 among them) answer at 9600.
+AUTO_BAUDS = (10400, 9600)
+
 #: Bit time for the 5-baud init (one fifth of a second per bit).
 BIT_TIME = 0.2
+
+
+def five_baud_bits(address: int) -> list[int]:
+    """Bit sequence of the 5-baud wake-up: start, 7 data bits LSB first,
+    odd parity, stop. Returns 10 values of 0 (line low / break) or 1."""
+    data = [(address >> i) & 1 for i in range(7)]
+    parity = 1 - (sum(data) & 1)          # odd parity: total ones must be odd
+    return [0, *data, parity, 1]
 
 
 class Transport(ABC):
@@ -53,6 +67,16 @@ class Transport(ABC):
 
     #: Descriptive name, used in logs and error messages.
     name: str = "unknown"
+
+    #: Current baud rate, or None when the transport has no such notion.
+    baud: int | None = None
+
+    #: True when the client may switch between :data:`AUTO_BAUDS` on its own.
+    auto_baud: bool = False
+
+    def set_baud(self, baud: int) -> bool:
+        """Change the baud rate. Returns False if the transport cannot."""
+        return False
 
     @abstractmethod
     def write_byte(self, b: int) -> None:
@@ -98,10 +122,12 @@ class SerialTransport(Transport):
     def __init__(
         self,
         port: str,
-        baud: int = BAUD,
+        baud: int | None = None,
         timeout: float = 1.0,
         bit_time: float = BIT_TIME,
     ) -> None:
+        """Open ``port``. With ``baud=None`` the client starts at 10400 and
+        falls back to 9600 by itself; a given ``baud`` is used as is."""
         try:
             import serial
         except ImportError as exc:  # pragma: no cover - dependency check
@@ -112,10 +138,12 @@ class SerialTransport(Transport):
 
         self.name = port
         self.bit_time = bit_time
+        self.auto_baud = baud is None
+        self.baud = baud or BAUD
         try:
             self._serial = serial.Serial(
                 port=port,
-                baudrate=baud,
+                baudrate=self.baud,
                 bytesize=serial.EIGHTBITS,
                 parity=serial.PARITY_NONE,
                 stopbits=serial.STOPBITS_ONE,
@@ -158,25 +186,39 @@ class SerialTransport(Transport):
         except Exception:  # pragma: no cover - needs hardware
             pass
 
+    def set_baud(self, baud: int) -> bool:
+        try:
+            self._serial.baudrate = baud
+        except Exception as exc:  # pragma: no cover - needs hardware
+            raise TransportError(
+                f"Could not set {baud} baud on {self.name}: {exc}"
+            ) from exc
+        self.baud = baud
+        return True
+
     # -- 5-baud wake-up ----------------------------------------------------
 
     def send_5baud_address(self, address: int) -> None:
         """Bit-bang the module address using the break condition, 200 ms per bit.
 
-        Order: start bit (break ON), eight data bits LSB first (0 = break ON,
-        1 = break OFF), stop bit (break OFF).
+        KW1281 sends the address as **7 data bits plus odd parity** (7O1), not
+        as a plain 8-bit byte. For 0x01 the two are identical on the wire, but
+        0x17 (cluster) must go out as 0x97 and 0x03 (ABS) as 0x83.
+
+        Order: start bit (break ON), seven data bits LSB first (0 = break ON,
+        1 = break OFF), odd parity bit, stop bit (break OFF).
+
+        Nothing is flushed afterwards: the module may answer with its sync byte
+        very soon after the stop bit, and a flush would throw that away. The
+        caller skips the echo garbage (the break shows up as 0x00 bytes on our
+        own receiver) while it waits for 0x55.
         """
         self.flush_input()
         ser = self._serial
         try:
-            ser.break_condition = True          # start bit
-            time.sleep(self.bit_time)
-            for i in range(8):
-                bit = (address >> i) & 1
+            for bit in five_baud_bits(address):
                 ser.break_condition = bit == 0
                 time.sleep(self.bit_time)
-            ser.break_condition = False         # stop bit
-            time.sleep(self.bit_time)
         except Exception as exc:  # pragma: no cover - needs hardware
             raise TransportError(
                 f"Could not send the 5-baud address on {self.name}: {exc}"
@@ -186,7 +228,6 @@ class SerialTransport(Transport):
                 ser.break_condition = False
             except Exception:  # pragma: no cover
                 pass
-        self.flush_input()
 
     def close(self) -> None:
         try:
